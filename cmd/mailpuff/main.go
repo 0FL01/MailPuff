@@ -28,7 +28,7 @@ func buildViewerURL(base, id, token string) string {
 
 func main() {
 	cfg := config.Load()
-	log.Printf("starting mailpuff with poll interval %s, mailbox %s", cfg.PollInterval, cfg.Mailbox)
+    log.Printf("starting mailpuff poll=%s mailbox=%s http=%s ttl=%s maxViews=%d", cfg.PollInterval, cfg.Mailbox, cfg.HTTPAddr, cfg.ViewerPageTTL, cfg.ViewerPageMaxViews)
 
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
@@ -39,7 +39,9 @@ func main() {
     store.SetOnDelete(func(p *viewer.Page, reason string) {
         // При удалении страницы оставляем Telegram-сообщение; удаляем только страницу из памяти
         if p != nil {
-            log.Printf("cleanup: page %s removed from memory (%s); telegram message kept", p.ID, reason)
+            // Маскируем id
+            masked := maskID(p.ID)
+            log.Printf("cleanup: page id=%s reason=%s kept_telegram_message chat_id=%d msg_id=%d", masked, reason, p.ChatID, p.MessageID)
         }
     })
 	// При первом открытии страницы — опционально помечаем письмо прочитанным в IMAP
@@ -62,16 +64,16 @@ func main() {
 			Mailbox:  cfg.Mailbox,
 		}
 		m, err := imapPkg.ConnectAndSelect(imapCfg)
-		if err != nil {
-			log.Printf("imap connect (first-view mark seen) error: %v", err)
+        if err != nil {
+            log.Printf("imap connect error during first-view mark-seen: %v", err)
 			return
 		}
 		defer func() { _ = m.Close() }()
-		if err := imapPkg.MarkSeen(m, p.IMAPUID); err != nil {
-			log.Printf("mark seen UID %d error: %v", p.IMAPUID, err)
+        if err := imapPkg.MarkSeen(m, p.IMAPUID); err != nil {
+            log.Printf("imap mark_seen error uid=%d: %v", p.IMAPUID, err)
 			return
 		}
-		log.Printf("marked UID %d as seen on first HTML view", p.IMAPUID)
+        log.Printf("imap mark_seen ok uid=%d on first HTML view", p.IMAPUID)
 	})
     go func() {
         if err := viewer.StartHTTPServer(cfg.HTTPAddr, store); err != nil {
@@ -91,8 +93,8 @@ func main() {
 			Mailbox:  cfg.Mailbox,
 		}
         c, err := imapPkg.ConnectAndSelect(imapCfg)
-		if err != nil {
-			log.Printf("imap connect error: %v", err)
+        if err != nil {
+            log.Printf("imap connect error host=%s port=%d mailbox=%s: %v", imapCfg.Host, imapCfg.Port, imapCfg.Mailbox, err)
 			time.Sleep(cfg.PollInterval)
 			continue
 		}
@@ -101,13 +103,13 @@ func main() {
                 _ = c.Close()
 			}()
             uids, err := imapPkg.SearchUnseen(c)
-			if err != nil {
-				log.Printf("imap search error: %v", err)
+            if err != nil {
+                log.Printf("imap search_unseen error: %v", err)
 				return
 			}
             emailsMap, err := imapPkg.FetchEmails(c, uids)
-			if err != nil {
-				log.Printf("imap fetch error: %v", err)
+            if err != nil {
+                log.Printf("imap fetch_emails error uids=%v: %v", uids, err)
 				return
 			}
             for uid, em := range emailsMap {
@@ -118,35 +120,43 @@ func main() {
                     continue
                 }
                 sum := email.Summarize(em)
-				if err != nil {
-                    // Summarize не возвращает ошибку; оставлено на случай будущих изменений
-				}
-				if sum.HTMLBody == "" {
-                    log.Printf("message %d has no HTML or text body", uid)
+                if sum.HTMLBody == "" {
+                    log.Printf("email skip uid=%d reason=no_body", uid)
                     processed[uid] = struct{}{}
 					continue
 				}
                 // Создаём страницу в хранилище
                 id, token, err := store.CreatePage(sum.HTMLBody, cfg.ViewerPageTTL, cfg.ViewerPageMaxViews)
                 if err != nil {
-                    log.Printf("create page error: %v", err)
+                    log.Printf("viewer create_page error uid=%d: %v", uid, err)
                     processed[uid] = struct{}{}
                     continue
                 }
                 viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, token)
                 msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL)
-				if err != nil {
-					log.Printf("telegram send error: %v", err)
+                if err != nil {
+                    log.Printf("telegram send error uid=%d: %v", uid, err)
                     processed[uid] = struct{}{}
 					continue
 				}
                 store.SetMessageRef(id, cfg.TelegramChatID, msgID)
 				_ = store.SetIMAPUID(id, uid)
-                log.Printf("sent telegram message %d for UID %d; page %s", msgID, uid, id)
+                log.Printf("sent telegram message msg_id=%d uid=%d page_id=%s", msgID, uid, maskID(id))
                 processed[uid] = struct{}{}
 
 			}
 		}()
 		time.Sleep(cfg.PollInterval)
 	}
+}
+
+// maskID скрывает чувствительные идентификаторы (UUID) в логах, оставляя только часть.
+func maskID(id string) string {
+    if len(id) == 0 {
+        return "(empty)"
+    }
+    if len(id) <= 8 {
+        return "…"
+    }
+    return id[:4] + "…" + id[len(id)-4:]
 }

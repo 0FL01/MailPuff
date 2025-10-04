@@ -47,6 +47,18 @@ type Store struct {
 // и удаляет потенциально опасные конструкции (скрипты, обработчики событий и т.п.).
 var sanitizePolicy = bluemonday.UGCPolicy()
 
+// redactID маскирует чувствительный идентификатор страницы для логов
+// оставляя только небольшой фрагмент для корреляции.
+func redactID(id string) string {
+    if len(id) == 0 {
+        return "(empty)"
+    }
+    if len(id) <= 8 {
+        return "…"
+    }
+    return id[:4] + "…" + id[len(id)-4:]
+}
+
 func NewStore(defaultTTL time.Duration, defaultMaxViews int) *Store {
 	return &Store{
 		pages:           make(map[string]*Page),
@@ -152,43 +164,51 @@ func (s *Store) SetMessageRef(id string, chatID int64, messageID int) bool {
 
 // View возвращает HTML страницы при корректном токене. Увеличивает счётчик просмотров.
 // Если лимит просмотров превышен после этого просмотра, страница удаляется и колбэк вызывается.
+// ViewWithReason возвращает HTML и детальную причину отказа вместо простого bool.
+// Возможные reason: "", "not_found", "invalid_token", "expired".
+func (s *Store) ViewWithReason(id, token string) (html string, ok bool, reason string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    p, exists := s.pages[id]
+    if !exists {
+        return "", false, "not_found"
+    }
+    if token == "" || token != p.Token {
+        return "", false, "invalid_token"
+    }
+    // Проверка срока годности
+    if time.Now().After(p.ExpiresAt) {
+        // Удаляем как просроченную
+        delete(s.pages, id)
+        cb := s.onDelete
+        if cb != nil {
+            go cb(p, "expired")
+        }
+        return "", false, "expired"
+    }
+    // Разрешаем просмотр
+    firstView := p.Views == 0
+    p.Views++
+    content := p.HTML
+    // Колбэк самого первого просмотра
+    if firstView && s.onFirstView != nil {
+        go s.onFirstView(p)
+    }
+    // Если задан лимит и он превышен — удаляем после этого просмотра
+    if p.MaxViews > 0 && p.Views > p.MaxViews {
+        delete(s.pages, id)
+        cb := s.onDelete
+        if cb != nil {
+            go cb(p, "max_views")
+        }
+    }
+    return content, true, ""
+}
+
+// View сохраняет обратную совместимость: возвращает только html и ok.
 func (s *Store) View(id, token string) (html string, ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, exists := s.pages[id]
-	if !exists {
-		return "", false
-	}
-	if token == "" || token != p.Token {
-		return "", false
-	}
-	// Проверка срока годности
-	if time.Now().After(p.ExpiresAt) {
-		// Удаляем как просроченную
-		delete(s.pages, id)
-		cb := s.onDelete
-		if cb != nil {
-			go cb(p, "expired")
-		}
-		return "", false
-	}
-	// Разрешаем просмотр
-	firstView := p.Views == 0
-	p.Views++
-	content := p.HTML
-	// Колбэк самого первого просмотра
-	if firstView && s.onFirstView != nil {
-		go s.onFirstView(p)
-	}
-	// Если задан лимит и он превышен — удаляем после этого просмотра
-	if p.MaxViews > 0 && p.Views > p.MaxViews {
-		delete(s.pages, id)
-		cb := s.onDelete
-		if cb != nil {
-			go cb(p, "max_views")
-		}
-	}
-	return content, true
+    html, ok, _ = s.ViewWithReason(id, token)
+    return html, ok
 }
 
 // Delete удаляет страницу вручную и вызывает onDelete.
@@ -225,12 +245,16 @@ func StartHTTPServer(addr string, store *Store) error {
 	mux.HandleFunc("/view", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		tok := r.URL.Query().Get("token")
-		if id == "" || tok == "" {
+        if id == "" || tok == "" {
+            // Логируем причину, не раскрывая токен
+            log.Printf("view 404 reason=missing_params ip=%s id=%s", r.RemoteAddr, redactID(id))
 			http.NotFound(w, r)
 			return
 		}
-		html, ok := store.View(id, tok)
-		if !ok {
+        html, ok, reason := store.ViewWithReason(id, tok)
+        if !ok {
+            // Детально логируем причину (token не логируем), id маскируем
+            log.Printf("view 404 reason=%s ip=%s id=%s", reason, r.RemoteAddr, redactID(id))
 			http.NotFound(w, r)
 			return
 		}
@@ -238,16 +262,39 @@ func StartHTTPServer(addr string, store *Store) error {
 		_, _ = w.Write([]byte(html))
 	})
 
-	server := &http.Server{Addr: addr, Handler: logRequest(mux)}
+    server := &http.Server{Addr: addr, Handler: logRequest(mux)}
 	log.Printf("http server listening on %s", addr)
 	return server.ListenAndServe()
 }
 
+// statusRecorder фиксирует HTTP-статус и размер ответа.
+type statusRecorder struct {
+    http.ResponseWriter
+    status int
+    size   int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+    sr.status = code
+    sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Write(b []byte) (int, error) {
+    if sr.status == 0 {
+        sr.status = http.StatusOK
+    }
+    n, err := sr.ResponseWriter.Write(b)
+    sr.size += n
+    return n, err
+}
+
 func logRequest(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
-	})
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        rec := &statusRecorder{ResponseWriter: w}
+        next.ServeHTTP(rec, r)
+        dur := time.Since(start)
+        log.Printf("%s %s status=%d size=%d duration=%s", r.Method, r.URL.Path, rec.status, rec.size, dur)
+    })
 }
 
