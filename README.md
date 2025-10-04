@@ -28,14 +28,14 @@ docker compose logs -f
 ### Вариант 2: Одиночный контейнер `docker run`
 ```
 docker run -d \
-  --name mail-to-tg \
+  --name mailpuff \
   --restart unless-stopped \
   -p 8080:8080 \
   --env-file ./.env \
   -e TZ=${TZ:-UTC} \
-  mail-to-tg:latest
+  mailpuff:latest
 ```
-> Примечание: образ `mail-to-tg:latest` можно собрать локально `docker build -t mail-to-tg:latest .` или публиковать в свой реестр.
+> Примечание: образ `mailpuff:latest` можно собрать локально `docker build -t mailpuff:latest .` или публиковать в свой реестр.
 
 ## Переменные окружения
 Обязательные:

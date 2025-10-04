@@ -3,8 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: mail-to-tg:latest
-    container_name: mail-to-tg
+    image: mailpuff:latest
+    container_name: MailPuff
     restart: unless-stopped
     env_file:
       - .env

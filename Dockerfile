@@ -19,7 +19,7 @@ RUN go mod download
 RUN go mod tidy
 
 # Build static binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/mail-to-tg ./cmd/mail-to-tg
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/mailpuff ./cmd/mail-to-tg
 
 FROM alpine:3.22
 WORKDIR /app
@@ -28,8 +28,8 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S app && adduser -S app -G app
 
-COPY --from=builder /out/mail-to-tg /app/mail-to-tg
+COPY --from=builder /out/mailpuff /app/mailpuff
 
 USER app
 
-ENTRYPOINT ["/app/mail-to-tg"]
+ENTRYPOINT ["/app/mailpuff"]

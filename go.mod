@@ -1,4 +1,4 @@
-module mail-to-tg
+module mailpuff
 
 go 1.25
 
