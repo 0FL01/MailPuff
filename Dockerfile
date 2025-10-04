@@ -19,7 +19,7 @@ RUN go mod download
 RUN go mod tidy
 
 # Build static binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/mailpuff ./cmd/mail-to-tg
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/mailpuff ./cmd/mailpuff
 
 FROM alpine:3.22
 WORKDIR /app
