@@ -42,10 +42,31 @@ type Store struct {
 	onFirstView     func(*Page)
 }
 
-// sanitizePolicy определяет политику очистки HTML, пригодную для пользовательского контента.
-// Используем bluemonday.UGCPolicy(), которая разрешает безопасный подмножество HTML и атрибутов
-// и удаляет потенциально опасные конструкции (скрипты, обработчики событий и т.п.).
-var sanitizePolicy = bluemonday.UGCPolicy()
+// sanitizePolicy — настраиваемая политика очистки HTML, адаптированная под разметку писем.
+// Базируемся на UGCPolicy, затем разрешаем распространённые элементы и атрибуты,
+// используемые в email‑вёрстке (таблицы, inline‑стили, размеры картинок и т.п.).
+// Скрипты и обработчики событий по‑прежнему удаляются bluemonday.
+var sanitizePolicy = func() *bluemonday.Policy {
+    p := bluemonday.UGCPolicy()
+    // Разрешаем таблицы и типичные атрибуты таблиц
+    p.AllowElements("table", "thead", "tbody", "tfoot", "tr", "td", "th", "col", "colgroup")
+    p.AllowAttrs("align", "valign", "border", "cellpadding", "cellspacing", "bgcolor", "width", "height").OnElements("table")
+    p.AllowAttrs("colspan", "rowspan", "align", "valign", "width", "height").OnElements("td", "th")
+
+    // Разрешаем ограниченное использование inline‑стилей на базовых контейнерах
+    p.AllowAttrs("style").OnElements("table", "tr", "td", "th", "div", "span", "p", "img", "a", "ul", "ol", "li")
+
+    // Картинки: стандартные атрибуты + data: и cid: источники
+    p.AllowAttrs("src", "alt", "title", "width", "height").OnElements("img")
+    p.AllowDataURIImages()
+    p.AllowURLSchemes("http", "https", "mailto", "tel", "cid")
+
+    // Ссылки: target/rel часто встречаются в письмах
+    p.AllowAttrs("target", "rel").OnElements("a")
+
+    // Нестрогие URL по умолчанию уже проверяются bluemonday; relative URL оставляем запрещёнными
+    return p
+}()
 
 // redactID маскирует чувствительный идентификатор страницы для логов
 // оставляя только небольшой фрагмент для корреляции.
