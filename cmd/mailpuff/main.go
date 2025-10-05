@@ -4,6 +4,7 @@ import (
     "log"
     "net/url"
     "time"
+    "strings"
 
     tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -13,6 +14,17 @@ import (
     "mailpuff/pkg/telegram"
     "mailpuff/pkg/viewer"
 )
+// answerCallback отправляет ответ на CallbackQuery, чтобы Telegram показал всплывающее уведомление
+func answerCallback(bot *tgbotapi.BotAPI, callbackID string, text string) error {
+    cfg := tgbotapi.CallbackConfig{
+        CallbackQueryID: callbackID,
+        Text:            text,
+        ShowAlert:       false,
+        CacheTime:       0,
+    }
+    _, err := bot.Request(cfg)
+    return err
+}
 
 func buildViewerURL(base, id, token string) string {
 	u, err := url.Parse(base)
@@ -39,6 +51,12 @@ func buildMarkURL(base, id, token string) string {
     q.Set("token", token)
     u.RawQuery = q.Encode()
     return u.String()
+}
+
+// buildMarkCallbackData формирует callback data для кнопки "Mark as read".
+// Формат: "mark:<id>:<token>"
+func buildMarkCallbackData(id, token string) string {
+    return "mark:" + id + ":" + token
 }
 
 func main() {
@@ -90,26 +108,84 @@ func main() {
 		}
         log.Printf("imap mark_seen ok uid=%d on first HTML view", p.IMAPUID)
 	})
-    go func() {
-        // Обработчик для /mark_read: подключаемся к IMAP и помечаем письмо прочитанным
-        markSeen := func(uid int) error {
-            imapCfg := imapPkg.Config{
-                Host:     cfg.IMAPHost,
-                Port:     cfg.IMAPPort,
-                Username: cfg.IMAPUsername,
-                Password: cfg.IMAPPassword,
-                UseTLS:   cfg.IMAPUseTLS,
-                Mailbox:  cfg.Mailbox,
-            }
-            m, err := imapPkg.ConnectAndSelect(imapCfg)
-            if err != nil {
-                return err
-            }
-            defer func() { _ = m.Close() }()
-            return imapPkg.MarkSeen(m, uid)
+    // Обработчик для пометки прочитанным через IMAP (переиспользуется HTTP и Telegram callback)
+    markSeen := func(uid int) error {
+        imapCfg := imapPkg.Config{
+            Host:     cfg.IMAPHost,
+            Port:     cfg.IMAPPort,
+            Username: cfg.IMAPUsername,
+            Password: cfg.IMAPPassword,
+            UseTLS:   cfg.IMAPUseTLS,
+            Mailbox:  cfg.Mailbox,
         }
+        m, err := imapPkg.ConnectAndSelect(imapCfg)
+        if err != nil {
+            return err
+        }
+        defer func() { _ = m.Close() }()
+        return imapPkg.MarkSeen(m, uid)
+    }
+
+    // HTTP сервер: поддержка /view и /mark_read
+    go func() {
         if err := viewer.StartHTTPServer(cfg.HTTPAddr, store, markSeen); err != nil {
             log.Fatalf("http server error: %v", err)
+        }
+    }()
+
+    // Telegram updates: обработка нажатий на кнопку Mark as read (callback)
+    go func() {
+        u := tgbotapi.NewUpdate(0)
+        u.Timeout = 60
+        updates := bot.GetUpdatesChan(u)
+        for upd := range updates {
+            if upd.CallbackQuery == nil {
+                continue
+            }
+            data := upd.CallbackQuery.Data
+            if !strings.HasPrefix(data, "mark:") {
+                continue
+            }
+
+            // Ожидаем формат: mark:<id>:<token>
+            parts := strings.SplitN(data, ":", 3)
+            if len(parts) != 3 {
+                _ = answerCallback(bot, upd.CallbackQuery.ID, "Invalid data")
+                log.Printf("tg callback invalid_data chat_id=%d msg_id=%d data=%q", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, data)
+                continue
+            }
+            id := parts[1]
+            tok := parts[2]
+
+            page, ok, reason := store.Authorize(id, tok)
+            if !ok {
+                _ = answerCallback(bot, upd.CallbackQuery.ID, "Link expired or invalid")
+                log.Printf("tg callback mark_read 404 reason=%s chat_id=%d msg_id=%d id=%s", reason, upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, maskID(id))
+                continue
+            }
+            if page.IMAPUID <= 0 {
+                _ = answerCallback(bot, upd.CallbackQuery.ID, "IMAP UID missing")
+                log.Printf("tg callback mark_read 404 reason=missing_imap_uid chat_id=%d msg_id=%d id=%s", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, maskID(id))
+                continue
+            }
+            if err := markSeen(page.IMAPUID); err != nil {
+                _ = answerCallback(bot, upd.CallbackQuery.ID, "Failed to mark as read")
+                log.Printf("tg callback mark_read 500 uid=%d id=%s err=%v", page.IMAPUID, maskID(id), err)
+                continue
+            }
+
+            // Успех: отвечаем всплывашкой и обновляем клавиатуру (убираем Mark as read)
+            _ = answerCallback(bot, upd.CallbackQuery.ID, "Marked as read")
+
+            viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, tok)
+            btnView := tgbotapi.NewInlineKeyboardButtonURL("Open html", viewerURL)
+            newMarkup := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnView))
+            edit := tgbotapi.NewEditMessageReplyMarkup(upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, newMarkup)
+            if _, err := bot.Request(edit); err != nil {
+                log.Printf("tg callback mark_read edit_keyboard error chat_id=%d msg_id=%d err=%v", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, err)
+            }
+
+            log.Printf("tg callback mark_read ok uid=%d chat_id=%d msg_id=%d id=%s", page.IMAPUID, upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, maskID(id))
         }
     }()
 
@@ -165,8 +241,8 @@ func main() {
                     continue
                 }
                 viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, token)
-                markURL := buildMarkURL(cfg.ViewerBaseURL, id, token)
-                msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL, markURL)
+                markCB := buildMarkCallbackData(id, token)
+                msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL, markCB)
                 if err != nil {
                     log.Printf("telegram send error uid=%d: %v", uid, err)
                     processed[uid] = struct{}{}
