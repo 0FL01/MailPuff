@@ -7,7 +7,7 @@ import (
     telegram "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-func SendMessage(bot *telegram.BotAPI, chatID int64, subject, fromName, fromAddress, buttonURL string) (int, error) {
+func SendMessage(bot *telegram.BotAPI, chatID int64, subject, fromName, fromAddress, viewURL string, markURL string) (int, error) {
     if fromName == "" {
         fromName = "Unknown sender"
     }
@@ -19,8 +19,11 @@ func SendMessage(bot *telegram.BotAPI, chatID int64, subject, fromName, fromAddr
     fromNameEsc := html.EscapeString(fromName)
     fromAddressEsc := html.EscapeString(fromAddress)
     text := fmt.Sprintf("%s\n%s\n\nA new email has arrived from this address: %s\n\n🌐 A secret HTML page has been created for it, where you can preview the message by following the link below 👇", subjectEsc, fromNameEsc, fromAddressEsc)
-    btn := telegram.NewInlineKeyboardButtonURL("Open html", buttonURL)
-	markup := telegram.NewInlineKeyboardMarkup(telegram.NewInlineKeyboardRow(btn))
+    btnView := telegram.NewInlineKeyboardButtonURL("Open html", viewURL)
+    btnMark := telegram.NewInlineKeyboardButtonURL("Mark as read", markURL)
+    markup := telegram.NewInlineKeyboardMarkup(
+        telegram.NewInlineKeyboardRow(btnView, btnMark),
+    )
 	msg := telegram.NewMessage(chatID, text)
 	msg.ReplyMarkup = markup
 	msg.DisableWebPagePreview = true

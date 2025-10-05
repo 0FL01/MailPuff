@@ -26,6 +26,21 @@ func buildViewerURL(base, id, token string) string {
 	return u.String()
 }
 
+// buildMarkURL формирует URL для действия mark_read на том же хосте, что и viewer base URL.
+func buildMarkURL(base, id, token string) string {
+    u, err := url.Parse(base)
+    if err != nil {
+        return base
+    }
+    // Заменяем путь на /mark_read, сохраняя схему/хост/порт
+    u.Path = "/mark_read"
+    q := u.Query()
+    q.Set("id", id)
+    q.Set("token", token)
+    u.RawQuery = q.Encode()
+    return u.String()
+}
+
 func main() {
 	cfg := config.Load()
     log.Printf("starting mailpuff poll=%s mailbox=%s http=%s ttl=%s maxViews=%d", cfg.PollInterval, cfg.Mailbox, cfg.HTTPAddr, cfg.ViewerPageTTL, cfg.ViewerPageMaxViews)
@@ -76,7 +91,24 @@ func main() {
         log.Printf("imap mark_seen ok uid=%d on first HTML view", p.IMAPUID)
 	})
     go func() {
-        if err := viewer.StartHTTPServer(cfg.HTTPAddr, store); err != nil {
+        // Обработчик для /mark_read: подключаемся к IMAP и помечаем письмо прочитанным
+        markSeen := func(uid int) error {
+            imapCfg := imapPkg.Config{
+                Host:     cfg.IMAPHost,
+                Port:     cfg.IMAPPort,
+                Username: cfg.IMAPUsername,
+                Password: cfg.IMAPPassword,
+                UseTLS:   cfg.IMAPUseTLS,
+                Mailbox:  cfg.Mailbox,
+            }
+            m, err := imapPkg.ConnectAndSelect(imapCfg)
+            if err != nil {
+                return err
+            }
+            defer func() { _ = m.Close() }()
+            return imapPkg.MarkSeen(m, uid)
+        }
+        if err := viewer.StartHTTPServer(cfg.HTTPAddr, store, markSeen); err != nil {
             log.Fatalf("http server error: %v", err)
         }
     }()
@@ -133,7 +165,8 @@ func main() {
                     continue
                 }
                 viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, token)
-                msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL)
+                markURL := buildMarkURL(cfg.ViewerBaseURL, id, token)
+                msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL, markURL)
                 if err != nil {
                     log.Printf("telegram send error uid=%d: %v", uid, err)
                     processed[uid] = struct{}{}

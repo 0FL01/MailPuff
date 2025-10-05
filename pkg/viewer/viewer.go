@@ -232,6 +232,30 @@ func (s *Store) View(id, token string) (html string, ok bool) {
     return html, ok
 }
 
+// Authorize проверяет корректность id/token и срок действия без инкремента просмотров.
+// Возвращает страницу при успехе. Возможные reason: "", "not_found", "invalid_token", "expired".
+func (s *Store) Authorize(id, token string) (p *Page, ok bool, reason string) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    page, exists := s.pages[id]
+    if !exists {
+        return nil, false, "not_found"
+    }
+    if token == "" || token != page.Token {
+        return nil, false, "invalid_token"
+    }
+    // Проверка срока годности
+    if time.Now().After(page.ExpiresAt) {
+        delete(s.pages, id)
+        cb := s.onDelete
+        if cb != nil {
+            go cb(page, "expired")
+        }
+        return nil, false, "expired"
+    }
+    return page, true, ""
+}
+
 // Delete удаляет страницу вручную и вызывает onDelete.
 func (s *Store) Delete(id string) bool {
 	deleted := s.delete(id, "manual")
@@ -261,7 +285,7 @@ func (s *Store) getOnDelete() OnDeleteCallback {
 }
 
 // StartHTTPServer запускает простой HTTP-сервер с эндпоинтом /view?id=UUID&token=TOKEN
-func StartHTTPServer(addr string, store *Store) error {
+func StartHTTPServer(addr string, store *Store, markSeen func(uid int) error) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/view", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
@@ -282,6 +306,41 @@ func StartHTTPServer(addr string, store *Store) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(html))
 	})
+
+    // /mark_read?id=UUID&token=TOKEN — помечает письмо прочитанным в IMAP без изменения счётчика просмотров
+    mux.HandleFunc("/mark_read", func(w http.ResponseWriter, r *http.Request) {
+        id := r.URL.Query().Get("id")
+        tok := r.URL.Query().Get("token")
+        if id == "" || tok == "" {
+            log.Printf("mark_read 404 reason=missing_params ip=%s id=%s", r.RemoteAddr, redactID(id))
+            http.NotFound(w, r)
+            return
+        }
+        page, ok, reason := store.Authorize(id, tok)
+        if !ok {
+            log.Printf("mark_read 404 reason=%s ip=%s id=%s", reason, r.RemoteAddr, redactID(id))
+            http.NotFound(w, r)
+            return
+        }
+        if page.IMAPUID <= 0 {
+            log.Printf("mark_read 404 reason=missing_imap_uid ip=%s id=%s", r.RemoteAddr, redactID(id))
+            http.NotFound(w, r)
+            return
+        }
+        if markSeen == nil {
+            log.Printf("mark_read 500 reason=handler_not_configured id=%s", redactID(id))
+            http.Error(w, "mark action is not configured", http.StatusInternalServerError)
+            return
+        }
+        if err := markSeen(page.IMAPUID); err != nil {
+            log.Printf("mark_read 500 reason=imap_error uid=%d id=%s err=%v", page.IMAPUID, redactID(id), err)
+            http.Error(w, "failed to mark as read", http.StatusInternalServerError)
+            return
+        }
+        log.Printf("mark_read ok uid=%d id=%s", page.IMAPUID, redactID(id))
+        w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+        _, _ = w.Write([]byte("OK"))
+    })
 
     server := &http.Server{Addr: addr, Handler: logRequest(mux)}
 	log.Printf("http server listening on %s", addr)
