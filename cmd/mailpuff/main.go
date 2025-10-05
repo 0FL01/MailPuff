@@ -1,10 +1,13 @@
 package main
 
 import (
+    "crypto/rand"
+    "encoding/base64"
     "log"
     "net/url"
     "time"
     "strings"
+    "sync"
 
     tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
@@ -54,10 +57,27 @@ func buildMarkURL(base, id, token string) string {
 }
 
 // buildMarkCallbackData формирует callback data для кнопки "Mark as read".
-// Формат: "mark:<id>:<token>"
-func buildMarkCallbackData(id, token string) string {
-    return "mark:" + id + ":" + token
+// Формат: "mark:<key>" (ключ хранится локально в памяти и маппится на id/token)
+func buildMarkCallbackData(key string) string {
+    return "mark:" + key
 }
+
+// genCallbackKey генерирует короткий URL-safe ключ для callback data
+func genCallbackKey(n int) string {
+    b := make([]byte, n)
+    if _, err := rand.Read(b); err != nil {
+        return "fallback"
+    }
+    return base64.RawURLEncoding.EncodeToString(b)
+}
+
+// локальная память для соответствия callback key -> (id, token)
+type markCallbackPayload struct {
+    ID    string
+    Token string
+}
+
+var markCbMap sync.Map
 
 func main() {
 	cfg := config.Load()
@@ -147,15 +167,23 @@ func main() {
                 continue
             }
 
-            // Ожидаем формат: mark:<id>:<token>
-            parts := strings.SplitN(data, ":", 3)
-            if len(parts) != 3 {
+            // Ожидаем формат: mark:<key>
+            parts := strings.SplitN(data, ":", 2)
+            if len(parts) != 2 {
                 _ = answerCallback(bot, upd.CallbackQuery.ID, "Invalid data")
                 log.Printf("tg callback invalid_data chat_id=%d msg_id=%d data=%q", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, data)
                 continue
             }
-            id := parts[1]
-            tok := parts[2]
+            key := parts[1]
+            payloadV, ok := markCbMap.Load(key)
+            if !ok {
+                _ = answerCallback(bot, upd.CallbackQuery.ID, "Link expired")
+                log.Printf("tg callback mark_read 404 reason=cbkey_not_found chat_id=%d msg_id=%d key=%q", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, key)
+                continue
+            }
+            payload := payloadV.(markCallbackPayload)
+            id := payload.ID
+            tok := payload.Token
 
             page, ok, reason := store.Authorize(id, tok)
             if !ok {
@@ -176,6 +204,7 @@ func main() {
 
             // Успех: отвечаем всплывашкой и обновляем клавиатуру (убираем Mark as read)
             _ = answerCallback(bot, upd.CallbackQuery.ID, "Marked as read")
+            markCbMap.Delete(key)
 
             viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, tok)
             btnView := tgbotapi.NewInlineKeyboardButtonURL("Open html", viewerURL)
@@ -241,7 +270,9 @@ func main() {
                     continue
                 }
                 viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, token)
-                markCB := buildMarkCallbackData(id, token)
+                cbKey := genCallbackKey(6)
+                markCbMap.Store(cbKey, markCallbackPayload{ID: id, Token: token})
+                markCB := buildMarkCallbackData(cbKey)
                 msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL, markCB)
                 if err != nil {
                     log.Printf("telegram send error uid=%d: %v", uid, err)
