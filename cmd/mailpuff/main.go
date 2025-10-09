@@ -290,6 +290,41 @@ func main() {
                 log.Printf("imap search_unseen error: %v", err)
 				return
 			}
+            // Авто-скрытие кнопки для писем, которые стали прочитанными в почтовом клиенте
+            unseenSet := make(map[int]struct{}, len(uids))
+            for _, u := range uids {
+                unseenSet[u] = struct{}{}
+            }
+            uidToMsg.Range(func(k, v any) bool {
+                uid, ok := k.(int)
+                if !ok {
+                    return true
+                }
+                if _, stillUnseen := unseenSet[uid]; stillUnseen {
+                    return true
+                }
+                // Письмо больше не в UNSEEN => считаем прочитанным, скрываем кнопку
+                ref, ok := v.(tgMessageRef)
+                if !ok {
+                    return true
+                }
+                viewerURL := buildViewerURL(cfg.ViewerBaseURL, ref.id, ref.token)
+                if err := hideMarkButton(bot, ref.chatID, ref.messageID, viewerURL); err != nil {
+                    log.Printf("imap auto-hide button failed uid=%d chat_id=%d msg_id=%d err=%v", uid, ref.chatID, ref.messageID, err)
+                    // Оставляем запись, попробуем на следующей итерации
+                    return true
+                }
+                // После успешного скрытия чистим callback-key и карту соответствий
+                if vKey, okKey := pageToCbKey.Load(ref.id); okKey {
+                    if cbKey, _ := vKey.(string); cbKey != "" {
+                        markCbMap.Delete(cbKey)
+                    }
+                    pageToCbKey.Delete(ref.id)
+                }
+                uidToMsg.Delete(uid)
+                log.Printf("imap auto-hide button ok uid=%d chat_id=%d msg_id=%d id=%s", uid, ref.chatID, ref.messageID, maskID(ref.id))
+                return true
+            })
             emailsMap, err := imapPkg.FetchEmails(c, uids)
             if err != nil {
                 log.Printf("imap fetch_emails error uids=%v: %v", uids, err)
@@ -318,6 +353,7 @@ func main() {
                 viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, token)
                 cbKey := genCallbackKey(6)
                 markCbMap.Store(cbKey, markCallbackPayload{ID: id, Token: token})
+                pageToCbKey.Store(id, cbKey)
                 markCB := buildMarkCallbackData(cbKey)
                 msgID, err := telegram.SendMessage(bot, cfg.TelegramChatID, sum.Subject, sum.FromName, sum.FromAddress, viewerURL, markCB)
                 if err != nil {
@@ -327,6 +363,8 @@ func main() {
 				}
                 store.SetMessageRef(id, cfg.TelegramChatID, msgID)
 				_ = store.SetIMAPUID(id, uid)
+                // Сохраняем соответствие UID -> Telegram сообщение/страница для дальнейшего авто-скрытия кнопки
+                uidToMsg.Store(uid, tgMessageRef{chatID: cfg.TelegramChatID, messageID: msgID, id: id, token: token})
                 log.Printf("sent telegram message msg_id=%d uid=%d page_id=%s", msgID, uid, maskID(id))
                 processed[uid] = struct{}{}
 
