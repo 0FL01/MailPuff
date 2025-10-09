@@ -79,6 +79,31 @@ type markCallbackPayload struct {
 
 var markCbMap sync.Map
 
+// tgMessageRef хранит сведения, необходимые для редактирования клавиатуры сообщения
+// при автоматическом скрытии кнопки "Mark as read".
+type tgMessageRef struct {
+    chatID    int64
+    messageID int
+    id        string
+    token     string
+}
+
+// uidToMsg сопоставляет IMAP UID -> ссылку на Telegram-сообщение и страницу viewer
+var uidToMsg sync.Map
+
+// pageToCbKey сопоставляет pageID -> callback key, чтобы можно было
+// удалить key из локального кэша после скрытия кнопки
+var pageToCbKey sync.Map
+
+// hideMarkButton обновляет клавиатуру сообщения, оставляя только кнопку "Open html".
+func hideMarkButton(bot *tgbotapi.BotAPI, chatID int64, messageID int, viewerURL string) error {
+    btnView := tgbotapi.NewInlineKeyboardButtonURL("Open html", viewerURL)
+    newMarkup := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnView))
+    edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, newMarkup)
+    _, err := bot.Request(edit)
+    return err
+}
+
 func main() {
 	cfg := config.Load()
     log.Printf("starting mailpuff poll=%s mailbox=%s http=%s ttl=%s maxViews=%d", cfg.PollInterval, cfg.Mailbox, cfg.HTTPAddr, cfg.ViewerPageTTL, cfg.ViewerPageMaxViews)
@@ -98,7 +123,7 @@ func main() {
         }
     })
 	// При первом открытии страницы — опционально помечаем письмо прочитанным в IMAP
-	store.SetOnFirstView(func(p *viewer.Page) {
+    store.SetOnFirstView(func(p *viewer.Page) {
 		if p == nil {
 			return
 		}
@@ -108,7 +133,7 @@ func main() {
 		if p.IMAPUID <= 0 {
 			return
 		}
-		imapCfg := imapPkg.Config{
+        imapCfg := imapPkg.Config{
 			Host:     cfg.IMAPHost,
 			Port:     cfg.IMAPPort,
 			Username: cfg.IMAPUsername,
@@ -127,6 +152,26 @@ func main() {
 			return
 		}
         log.Printf("imap mark_seen ok uid=%d on first HTML view", p.IMAPUID)
+
+        // После успешной отметки как прочитанного — скрываем кнопку в Telegram-сообщении
+        if p.ChatID != 0 && p.MessageID != 0 && p.ID != "" && p.Token != "" {
+            viewerURL := buildViewerURL(cfg.ViewerBaseURL, p.ID, p.Token)
+            if err := hideMarkButton(bot, p.ChatID, p.MessageID, viewerURL); err != nil {
+                log.Printf("tg edit keyboard on first-view uid=%d chat_id=%d msg_id=%d err=%v", p.IMAPUID, p.ChatID, p.MessageID, err)
+            }
+        }
+        // Чистим callback key и карту UID -> сообщение
+        if p.ID != "" {
+            if v, ok := pageToCbKey.Load(p.ID); ok {
+                if key, _ := v.(string); key != "" {
+                    markCbMap.Delete(key)
+                }
+                pageToCbKey.Delete(p.ID)
+            }
+        }
+        if p.IMAPUID > 0 {
+            uidToMsg.Delete(p.IMAPUID)
+        }
 	})
     // Обработчик для пометки прочитанным через IMAP (переиспользуется HTTP и Telegram callback)
     markSeen := func(uid int) error {
@@ -207,12 +252,13 @@ func main() {
             markCbMap.Delete(key)
 
             viewerURL := buildViewerURL(cfg.ViewerBaseURL, id, tok)
-            btnView := tgbotapi.NewInlineKeyboardButtonURL("Open html", viewerURL)
-            newMarkup := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnView))
-            edit := tgbotapi.NewEditMessageReplyMarkup(upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, newMarkup)
-            if _, err := bot.Request(edit); err != nil {
+            if err := hideMarkButton(bot, upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, viewerURL); err != nil {
                 log.Printf("tg callback mark_read edit_keyboard error chat_id=%d msg_id=%d err=%v", upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, err)
             }
+
+            // Очистка привязок для предотвращения повторной обработки
+            uidToMsg.Delete(page.IMAPUID)
+            pageToCbKey.Delete(id)
 
             log.Printf("tg callback mark_read ok uid=%d chat_id=%d msg_id=%d id=%s", page.IMAPUID, upd.CallbackQuery.Message.Chat.ID, upd.CallbackQuery.Message.MessageID, maskID(id))
         }
