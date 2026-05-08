@@ -8,6 +8,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/main.rs` - thin Rust entrypoint: config load, tracing init, top-level run.
 - `src/config.rs` - typed env parsing, defaults, fail-fast validation, secret redaction.
 - `src/mail_source` - provider-neutral mail source boundary; IMAP is the first backend, Proton custom is reserved.
+- `src/viewer` - Rust in-memory page store, sanitizer, and axum `/view` + `/mark_read` routes.
 - `cmd/mailpuff/main.go` - legacy Go reference for orchestration behavior during migration.
 - `pkg/config` - environment parsing, defaults, required variable validation.
 - `pkg/imap` - IMAP connect/select/search/fetch/mark-seen wrapper.
@@ -27,7 +28,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - Runtime is intended to be Docker-only; prefer Docker/Compose instructions for operation.
 - Viewer pages are stored only in process memory. Container restart invalidates all existing links.
 - Message deduplication must remain process-local; after restart, old unseen messages can be processed again.
-- Never bypass `pkg/viewer` sanitization when storing or serving email HTML.
+- Never bypass `src/viewer` sanitization when storing or serving email HTML; legacy `pkg/viewer` remains reference only.
 - Viewer URLs must include both `id` and `token`; do not log tokens, and keep page IDs masked in logs.
 - `IMAP_TLS=false` is legacy compatibility mode; plaintext IMAP must not be enabled silently. Use `IMAP_ACCEPT_INVALID_CERTS=true` only with explicit warning.
 - Telegram messages are not deleted when viewer pages expire; only the in-memory page is removed.
@@ -46,9 +47,9 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - If HTML is missing, `text/plain` is escaped and wrapped in `<pre>`; emails with no HTML/text body are skipped by `cmd/mailpuff/main.go`.
 
 ### Viewer
-- `pkg/viewer/viewer.go` owns page lifecycle: `CreatePage`, `ViewWithReason`, `Authorize`, TTL deletion, and max-view deletion.
-- Sanitization uses a customized `bluemonday.UGCPolicy`; scripts and event handlers must remain blocked.
-- `/view` increments views and may trigger first-view callbacks; `/mark_read` authorizes without incrementing views.
+- `src/viewer/store.rs` owns Rust page lifecycle: create, authorize, view count, TTL expiry, and max-view deletion.
+- `src/viewer/sanitize.rs` uses Ammonia allowlist sanitization; scripts and event handlers must remain blocked.
+- `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views.
 
 ### Telegram
 - `pkg/telegram/telegram.go` sends one message with `Open html` URL button and `Mark as read` callback button.
@@ -70,6 +71,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `README.md` - env variables, viewer behavior, security notes, known limitations.
 - `src/config.rs` - Rust env contract and validation behavior.
 - `src/mail_source` - provider-neutral source model for IMAP and future custom providers.
+- `src/viewer` - Rust viewer store, sanitizer, HTTP routes, and tests.
 - `cmd/mailpuff/main.go` - legacy end-to-end data flow and Telegram/IMAP/viewer integration.
 - `pkg/viewer/viewer.go` - HTTP routes, token checks, TTL/max-view logic.
 - `pkg/config/config.go` - required env vars and defaults.
