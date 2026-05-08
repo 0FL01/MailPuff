@@ -52,6 +52,7 @@ pub async fn run(config: Config) -> Result<()> {
         Arc::clone(&page_store),
         config.viewer.remote_images,
         Arc::clone(&mark_read_handler),
+        mail_mark_seen_on_first_view(&config.mail_source),
     );
     let telegram_task = tokio::spawn({
         let telegram_bot = Arc::clone(&telegram_bot);
@@ -137,6 +138,12 @@ fn build_mail_source(config: &MailSourceConfig) -> Arc<dyn MailSource> {
 fn mail_poll_interval(config: &MailSourceConfig) -> std::time::Duration {
     match config {
         MailSourceConfig::Imap(imap) => imap.poll_interval,
+    }
+}
+
+fn mail_mark_seen_on_first_view(config: &MailSourceConfig) -> bool {
+    match config {
+        MailSourceConfig::Imap(imap) => imap.mark_seen,
     }
 }
 

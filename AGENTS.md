@@ -55,8 +55,8 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 ### Viewer
 - `src/viewer/store.rs` owns Rust page lifecycle: create, authorize, view count, TTL expiry, and max-view deletion.
 - `src/viewer/sanitize.rs` uses Ammonia allowlist sanitization; scripts and event handlers must remain blocked.
-- `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views.
-- `src/orchestration.rs` provides the real mark-read handler used by HTTP and Telegram paths; first-view mark-seen and cleanup loop are still pending.
+- `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views, and `/view` triggers first-view mark-seen when enabled.
+- `src/orchestration.rs` provides the real mark-read handler used by HTTP, first-view, and Telegram paths; cleanup loop is still pending.
 
 ### Telegram
 - `src/telegram/bot.rs` formats Telegram HTML messages, sends `Open html` + `Mark as read`, answers callbacks, and edits keyboards to keep only `Open html`.
