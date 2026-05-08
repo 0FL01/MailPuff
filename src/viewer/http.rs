@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     config::ViewerRemoteImages,
-    viewer::store::{AuthorizedPage, PageAccess, PageStore, ViewedPage},
+    viewer::store::{AuthorizedPage, DeletedPage, PageAccess, PageStore, ViewedPage},
 };
 
 #[derive(Clone)]
@@ -23,6 +23,7 @@ pub struct ViewerHttpState {
     store: Arc<PageStore>,
     remote_images: ViewerRemoteImages,
     mark_read: Arc<dyn MarkReadHandler>,
+    page_deleted: Arc<dyn PageDeletionHandler>,
     mark_seen_on_first_view: bool,
 }
 
@@ -32,12 +33,14 @@ impl ViewerHttpState {
         store: Arc<PageStore>,
         remote_images: ViewerRemoteImages,
         mark_read: Arc<dyn MarkReadHandler>,
+        page_deleted: Arc<dyn PageDeletionHandler>,
         mark_seen_on_first_view: bool,
     ) -> Self {
         Self {
             store,
             remote_images,
             mark_read,
+            page_deleted,
             mark_seen_on_first_view,
         }
     }
@@ -80,6 +83,31 @@ pub enum MarkReadError {
     Backend(String),
 }
 
+pub trait PageDeletionHandler: Send + Sync + 'static {
+    fn page_deleted(&self, page: DeletedPage) -> Result<PageDeletionResult, PageDeletionError>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopPageDeletionHandler;
+
+impl PageDeletionHandler for NoopPageDeletionHandler {
+    fn page_deleted(&self, _page: DeletedPage) -> Result<PageDeletionResult, PageDeletionError> {
+        Ok(PageDeletionResult::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageDeletionResult {
+    pub callback_deleted: bool,
+    pub tracked_removed: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum PageDeletionError {
+    #[error("page deletion backend failed: {0}")]
+    Backend(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct PageQuery {
     id: Option<String>,
@@ -93,7 +121,7 @@ async fn view(State(state): State<ViewerHttpState>, Query(query): Query<PageQuer
 
     match state.store.view(id, &token) {
         Ok(PageAccess::Granted(page)) => {
-            trigger_first_view_mark_read(&state, &page);
+            handle_view_side_effects(&state, &page);
             html_response(page.html, state.remote_images)
         }
         Ok(PageAccess::Denied(_)) => not_found(),
@@ -104,16 +132,34 @@ async fn view(State(state): State<ViewerHttpState>, Query(query): Query<PageQuer
     }
 }
 
-fn trigger_first_view_mark_read(state: &ViewerHttpState, page: &ViewedPage) {
-    if !state.mark_seen_on_first_view || !page.first_view {
+fn handle_view_side_effects(state: &ViewerHttpState, page: &ViewedPage) {
+    let deleted_after_view = page.deleted_after_view.map(|reason| DeletedPage {
+        id: page.id,
+        reason,
+        mail_ref: page.mail_ref.clone(),
+    });
+
+    if state.mark_seen_on_first_view
+        && page.first_view
+        && let Some(mail_ref) = page.mail_ref.clone()
+    {
+        trigger_first_view_mark_read(state, page, mail_ref, deleted_after_view);
         return;
     }
 
-    let Some(mail_ref) = page.mail_ref.clone() else {
-        return;
-    };
+    if let Some(deleted) = deleted_after_view {
+        handle_deleted_page(state.page_deleted.as_ref(), deleted);
+    }
+}
 
+fn trigger_first_view_mark_read(
+    state: &ViewerHttpState,
+    page: &ViewedPage,
+    mail_ref: crate::mail_source::MessageRef,
+    deleted_after_view: Option<DeletedPage>,
+) {
     let mark_read = Arc::clone(&state.mark_read);
+    let page_deleted = Arc::clone(&state.page_deleted);
     let page = AuthorizedPage {
         id: page.id,
         created_at: page.created_at,
@@ -137,7 +183,32 @@ fn trigger_first_view_mark_read(state: &ViewerHttpState, page: &ViewedPage) {
                 "first-view mark-read failed"
             ),
         }
+
+        if let Some(deleted) = deleted_after_view {
+            handle_deleted_page(page_deleted.as_ref(), deleted);
+        }
     });
+}
+
+fn handle_deleted_page(handler: &dyn PageDeletionHandler, page: DeletedPage) {
+    let page_id = page.id;
+    let reason = page.reason;
+
+    match handler.page_deleted(page) {
+        Ok(result) => tracing::info!(
+            page_id = %masked_uuid(page_id),
+            reason = ?reason,
+            callback_deleted = result.callback_deleted,
+            tracked_removed = result.tracked_removed,
+            "viewer page deleted after view"
+        ),
+        Err(error) => tracing::error!(
+            page_id = %masked_uuid(page_id),
+            reason = ?reason,
+            %error,
+            "viewer page deletion side effects failed"
+        ),
+    }
 }
 
 async fn mark_read(
@@ -217,6 +288,11 @@ fn plain_text(status: StatusCode, body: &'static str) -> Response {
 
 fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
+}
+
+pub(crate) fn masked_uuid(id: Uuid) -> String {
+    let value = id.to_string();
+    format!("{}...{}", &value[..4], &value[value.len() - 4..])
 }
 
 const fn content_security_policy(remote_images: ViewerRemoteImages) -> &'static str {
@@ -323,6 +399,18 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingPageDeletionHandler {
+        deleted: Mutex<Vec<DeletedPage>>,
+    }
+
+    impl PageDeletionHandler for RecordingPageDeletionHandler {
+        fn page_deleted(&self, page: DeletedPage) -> Result<PageDeletionResult, PageDeletionError> {
+            self.deleted.lock().expect("deleted lock").push(page);
+            Ok(PageDeletionResult::default())
+        }
+    }
+
     fn page_store(max_views: Option<u32>) -> Arc<PageStore> {
         Arc::new(PageStore::new(PageStoreConfig {
             page_ttl: Duration::from_secs(60),
@@ -368,6 +456,7 @@ mod tests {
             store,
             ViewerRemoteImages::Allow,
             Arc::new(NoopMarkReadHandler),
+            Arc::new(NoopPageDeletionHandler),
             false,
         ));
 
@@ -405,6 +494,7 @@ mod tests {
             store,
             ViewerRemoteImages::Allow,
             Arc::new(NoopMarkReadHandler),
+            Arc::new(NoopPageDeletionHandler),
             false,
         ));
 
@@ -431,6 +521,7 @@ mod tests {
             Arc::clone(&store),
             ViewerRemoteImages::Allow,
             handler.clone(),
+            Arc::new(NoopPageDeletionHandler),
             true,
         ));
 
@@ -477,6 +568,7 @@ mod tests {
             store,
             ViewerRemoteImages::Allow,
             handler.clone(),
+            Arc::new(NoopPageDeletionHandler),
             false,
         ));
 
@@ -507,6 +599,7 @@ mod tests {
             store,
             ViewerRemoteImages::Allow,
             handler.clone(),
+            Arc::new(NoopPageDeletionHandler),
             true,
         ));
 
@@ -539,6 +632,7 @@ mod tests {
             store,
             ViewerRemoteImages::Allow,
             handler.clone(),
+            Arc::new(NoopPageDeletionHandler),
             true,
         ));
 
@@ -558,6 +652,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_view_deletion_notifies_page_deletion_handler()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = page_store(Some(1));
+        let mail_ref = mail_ref();
+        let page = store.create_page_with_options(
+            "<p>Hello</p>",
+            CreatePageOptions {
+                mail_ref: Some(mail_ref.clone()),
+            },
+        )?;
+        let deletion_handler = Arc::new(RecordingPageDeletionHandler::default());
+        let app = router(ViewerHttpState::new(
+            Arc::clone(&store),
+            ViewerRemoteImages::Allow,
+            Arc::new(NoopMarkReadHandler),
+            deletion_handler.clone(),
+            false,
+        ));
+
+        let response = send(
+            app,
+            format!("/view?id={}&token={}", page.id, page.token.expose_secret()),
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(store.is_empty()?);
+        let deleted = deletion_handler.deleted.lock().expect("deleted lock");
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, page.id);
+        assert_eq!(
+            deleted[0].reason,
+            crate::viewer::store::DeletionReason::MaxViews
+        );
+        assert_eq!(deleted[0].mail_ref, Some(mail_ref));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mark_read_authorizes_without_incrementing_views()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = page_store(Some(1));
@@ -572,6 +706,7 @@ mod tests {
             Arc::clone(&store),
             ViewerRemoteImages::Allow,
             Arc::new(OkMarkReadHandler),
+            Arc::new(NoopPageDeletionHandler),
             false,
         ));
 

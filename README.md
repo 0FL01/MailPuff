@@ -2,7 +2,7 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service, poll loop MVP, auto-hide external read и first-view mark-seen. Cleanup loop остаётся следующим шагом.
+> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service, poll loop MVP, auto-hide external read, first-view mark-seen и cleanup loop. Coordinated shutdown остаётся следующим шагом.
 
 ## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
@@ -106,7 +106,7 @@ TZ=UTC
 - HTTP‑сервер слушает `HTTP_ADDR` (по умолчанию `:8080`), в Docker пробрасывается на хост `8080:8080`.
 - Основной маршрут: `/view?id=<UUID>&token=<TOKEN>` — возвращает HTML письма при валидном токене.
 - Санитизация HTML: используется allowlist-политика Ammonia для защиты от XSS; при отсутствии `HTML` содержимое `text/plain` заворачивается в безопасный `<pre>`.
-- TTL и лимит просмотров: после первого успешного открытия счётчик увеличивается; при достижении лимита страница удаляется из памяти после ответа. По истечении TTL страница также удаляется.
+- TTL и лимит просмотров: после первого успешного открытия счётчик увеличивается; при достижении лимита страница удаляется из памяти после ответа. По истечении TTL cleanup loop удаляет страницу и RAM mappings.
 
 ## Типовые сценарии
 - Изменить лимиты: укажите `VIEWER_PAGE_TTL` и/или `VIEWER_PAGE_MAX_VIEWS` в `.env`.
@@ -119,6 +119,6 @@ TZ=UTC
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
-- Rust poll loop уже создаёт viewer pages, отправляет новые Telegram messages и скрывает `Mark as read` после external read; cleanup loop ещё не подключён.
+- Coordinated graceful shutdown для фоновых задач ещё требует hardening.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).

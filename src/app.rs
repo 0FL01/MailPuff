@@ -4,7 +4,10 @@ use crate::{
     config::{Config, MailSourceConfig},
     error::{Error, Result},
     mail_source::{MailSource, imap::ImapSource},
-    orchestration::{EmailTelegramApi, MarkReadService, PollService, run_poll_loop},
+    orchestration::{
+        CleanupService, EmailTelegramApi, MarkReadService, PollService, cleanup_interval,
+        run_cleanup_loop, run_poll_loop,
+    },
     shutdown,
     state::RuntimeState,
     telegram::{
@@ -12,7 +15,7 @@ use crate::{
         callbacks::{CallbackStore, CallbackTelegramApi},
     },
     viewer::{
-        http::{self, MarkReadHandler, ViewerHttpState},
+        http::{self, MarkReadHandler, PageDeletionHandler, ViewerHttpState},
         store::{PageStore, PageStoreConfig},
     },
 };
@@ -41,6 +44,12 @@ pub async fn run(config: Config) -> Result<()> {
     let telegram_bot = Arc::new(TelegramBot::new(&config.telegram));
     let telegram_api: Arc<dyn CallbackTelegramApi> = telegram_bot.clone();
     let telegram_sender: Arc<dyn EmailTelegramApi> = telegram_bot.clone();
+    let cleanup_service = Arc::new(CleanupService::new(
+        Arc::clone(&page_store),
+        Arc::clone(&runtime_state),
+        Arc::clone(&callback_store),
+    ));
+    let page_deleted_handler: Arc<dyn PageDeletionHandler> = cleanup_service.clone();
     let mark_read_handler: Arc<dyn MarkReadHandler> = Arc::new(MarkReadService::new(
         Arc::clone(&mail_source),
         Arc::clone(&runtime_state),
@@ -52,6 +61,7 @@ pub async fn run(config: Config) -> Result<()> {
         Arc::clone(&page_store),
         config.viewer.remote_images,
         Arc::clone(&mark_read_handler),
+        page_deleted_handler,
         mail_mark_seen_on_first_view(&config.mail_source),
     );
     let telegram_task = tokio::spawn({
@@ -89,6 +99,15 @@ pub async fn run(config: Config) -> Result<()> {
             run_poll_loop(poll_service, poll_interval).await;
         }
     });
+    let cleanup_task = tokio::spawn({
+        let cleanup_service = Arc::clone(&cleanup_service);
+        let cleanup_interval = cleanup_interval(config.viewer.page_ttl);
+
+        async move {
+            info!(?cleanup_interval, "viewer cleanup loop started");
+            run_cleanup_loop(cleanup_service, cleanup_interval).await;
+        }
+    });
     let bind_addr = normalize_http_addr(&config.http.addr);
     let listener = TcpListener::bind(&bind_addr).await?;
 
@@ -116,6 +135,12 @@ pub async fn run(config: Config) -> Result<()> {
         && !error.is_cancelled()
     {
         tracing::error!(%error, "mail poll task failed during shutdown");
+    }
+    cleanup_task.abort();
+    if let Err(error) = cleanup_task.await
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "viewer cleanup task failed during shutdown");
     }
 
     info!("shutdown complete");

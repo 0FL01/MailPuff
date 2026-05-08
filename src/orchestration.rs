@@ -14,8 +14,11 @@ use crate::{
         callbacks::{CallbackStoreError, CallbackTelegramApi, build_viewer_url},
     },
     viewer::{
-        http::{MarkReadError, MarkReadHandler, MarkReadResult},
-        store::{AuthorizedPage, CreatePageOptions, PageStore},
+        http::{
+            MarkReadError, MarkReadHandler, MarkReadResult, PageDeletionError, PageDeletionHandler,
+            PageDeletionResult, masked_uuid,
+        },
+        store::{AuthorizedPage, CreatePageOptions, DeletedPage, PageStore, StoreError},
     },
 };
 
@@ -320,6 +323,110 @@ pub async fn run_poll_loop(service: PollService, poll_interval: Duration) {
     }
 }
 
+pub struct CleanupService {
+    page_store: Arc<PageStore>,
+    state: Arc<RuntimeState>,
+    callback_store: Arc<CallbackStore>,
+}
+
+impl CleanupService {
+    #[must_use]
+    pub fn new(
+        page_store: Arc<PageStore>,
+        state: Arc<RuntimeState>,
+        callback_store: Arc<CallbackStore>,
+    ) -> Self {
+        Self {
+            page_store,
+            state,
+            callback_store,
+        }
+    }
+
+    pub fn cleanup_expired_once(&self) -> Result<CleanupStats, CleanupError> {
+        let deleted = self.page_store.cleanup_expired()?;
+        let mut stats = CleanupStats {
+            deleted_pages: deleted.len(),
+            ..CleanupStats::default()
+        };
+
+        for page in deleted {
+            let result = self.handle_deleted_page(page.clone())?;
+            stats.callbacks_deleted += usize::from(result.callback_deleted);
+            stats.tracked_removed += usize::from(result.tracked_removed);
+            tracing::info!(
+                page_id = %masked_uuid(page.id),
+                reason = ?page.reason,
+                callback_deleted = result.callback_deleted,
+                tracked_removed = result.tracked_removed,
+                "viewer page cleanup completed"
+            );
+        }
+
+        Ok(stats)
+    }
+
+    fn handle_deleted_page(&self, page: DeletedPage) -> Result<PageDeletionResult, CleanupError> {
+        let callback_deleted = self.callback_store.delete_page(page.id)?.is_some();
+        let mut tracked_removed = self.state.remove_tracked_by_page(page.id)?.is_some();
+
+        if !tracked_removed && let Some(mail_ref) = &page.mail_ref {
+            tracked_removed = self.state.remove_tracked(mail_ref)?.is_some();
+        }
+
+        Ok(PageDeletionResult {
+            callback_deleted,
+            tracked_removed,
+        })
+    }
+}
+
+impl PageDeletionHandler for CleanupService {
+    fn page_deleted(&self, page: DeletedPage) -> Result<PageDeletionResult, PageDeletionError> {
+        self.handle_deleted_page(page)
+            .map_err(|error| PageDeletionError::Backend(error.to_string()))
+    }
+}
+
+pub async fn run_cleanup_loop(service: Arc<CleanupService>, cleanup_interval: Duration) {
+    loop {
+        match service.cleanup_expired_once() {
+            Ok(stats) => tracing::info!(?stats, "viewer cleanup cycle completed"),
+            Err(error) => tracing::error!(%error, "viewer cleanup cycle failed"),
+        }
+
+        tokio::time::sleep(cleanup_interval).await;
+    }
+}
+
+#[must_use]
+pub fn cleanup_interval(page_ttl: Duration) -> Duration {
+    const MIN_INTERVAL: Duration = Duration::from_secs(10);
+    const MAX_INTERVAL: Duration = Duration::from_secs(60);
+
+    let tenth = page_ttl / 10;
+    std::cmp::min(std::cmp::max(tenth, MIN_INTERVAL), MAX_INTERVAL)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupStats {
+    pub deleted_pages: usize,
+    pub callbacks_deleted: usize,
+    pub tracked_removed: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum CleanupError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    #[error(transparent)]
+    RuntimeState(#[from] RuntimeStateError),
+
+    #[error(transparent)]
+    CallbackStore(#[from] CallbackStoreError),
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PollCycleStats {
     pub unread: usize,
@@ -462,7 +569,7 @@ mod tests {
         error::{Error, Result},
         mail_source::{MailSourceCapabilities, MailSourceKind, MessageRef, RawEmail},
         telegram::{TelegramError, TelegramMessageRef},
-        viewer::store::PageStoreConfig,
+        viewer::store::{DeletionReason, PageStoreConfig},
     };
 
     use secrecy::SecretString;
@@ -633,9 +740,13 @@ mod tests {
     }
 
     fn page_store() -> Arc<PageStore> {
+        page_store_with_config(Some(3), Duration::from_secs(60))
+    }
+
+    fn page_store_with_config(max_views: Option<u32>, ttl: Duration) -> Arc<PageStore> {
         Arc::new(PageStore::new(PageStoreConfig {
-            page_ttl: Duration::from_secs(60),
-            page_max_views: Some(3),
+            page_ttl: ttl,
+            page_max_views: max_views,
             remote_images: ViewerRemoteImages::Allow,
         }))
     }
@@ -744,6 +855,77 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(state.tracked_len()?, 1);
         assert!(callback_store.lookup(&callback.key)?.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_pages_removes_callbacks_and_tracking()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let page_store = page_store_with_config(None, Duration::from_millis(1));
+        let page = page_store.create_page_with_options(
+            "<p>Hello</p>",
+            CreatePageOptions {
+                mail_ref: Some(mail_ref.clone()),
+            },
+        )?;
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        state.track_message(mail_ref, page.id, TelegramMessageRef::new(100, 200))?;
+        let callback = callback_store.create(page.id, page.token)?;
+        let service = CleanupService::new(
+            Arc::clone(&page_store),
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let stats = service.cleanup_expired_once()?;
+
+        assert_eq!(
+            stats,
+            CleanupStats {
+                deleted_pages: 1,
+                callbacks_deleted: 1,
+                tracked_removed: 1,
+            }
+        );
+        assert!(page_store.is_empty()?);
+        assert!(callback_store.lookup(&callback.key)?.is_none());
+        assert_eq!(state.tracked_len()?, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_service_removes_mappings_for_max_view_deleted_page()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let page_id = uuid::Uuid::new_v4();
+        let mail_ref = mail_ref();
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        state.track_message(mail_ref.clone(), page_id, TelegramMessageRef::new(100, 200))?;
+        let callback = callback_store.create(page_id, SecretString::from("secret".to_owned()))?;
+        let service =
+            CleanupService::new(page_store, Arc::clone(&state), Arc::clone(&callback_store));
+
+        let result = service.page_deleted(DeletedPage {
+            id: page_id,
+            reason: DeletionReason::MaxViews,
+            mail_ref: Some(mail_ref),
+        })?;
+
+        assert_eq!(
+            result,
+            PageDeletionResult {
+                callback_deleted: true,
+                tracked_removed: true,
+            }
+        );
+        assert!(callback_store.lookup(&callback.key)?.is_none());
+        assert_eq!(state.tracked_len()?, 0);
 
         Ok(())
     }
