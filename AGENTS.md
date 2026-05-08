@@ -43,8 +43,9 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 ### IMAP Polling
 - Rust migration should route polling through `src/mail_source::MailSource`, not directly through IMAP-specific state.
 - `src/mail_source/imap.rs` implements connect/login/select, `UID SEARCH UNSEEN`, `UID FETCH RFC822`, and `+FLAGS (\Seen)` mark-read.
+- `src/orchestration.rs` runs the Rust poll loop MVP: list unread, fetch raw email, parse, create viewer page/callback, send Telegram, then update RAM indices.
 - Legacy main loop lives in `cmd/mailpuff/main.go`; it reconnects each poll, searches `UNSEEN`, fetches emails, skips already processed UIDs, and sleeps `IMAP_POLL_INTERVAL`.
-- IMAP operations are isolated in `pkg/imap/imap.go`; use those wrappers instead of calling the library directly from new code.
+- Legacy IMAP operations are isolated in `pkg/imap/imap.go`; use Rust `src/mail_source` for new code.
 - `IMAP_FORCE_RECONNECT` is loaded in config but is not currently used by the polling logic.
 
 ### Email Parsing
@@ -55,11 +56,11 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/viewer/store.rs` owns Rust page lifecycle: create, authorize, view count, TTL expiry, and max-view deletion.
 - `src/viewer/sanitize.rs` uses Ammonia allowlist sanitization; scripts and event handlers must remain blocked.
 - `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views.
-- `src/orchestration.rs` provides the real mark-read handler used by HTTP and Telegram paths; poll-loop population is still pending.
+- `src/orchestration.rs` provides the real mark-read handler used by HTTP and Telegram paths; first-view mark-seen and cleanup loop are still pending.
 
 ### Telegram
 - `src/telegram/bot.rs` formats Telegram HTML messages, sends `Open html` + `Mark as read`, answers callbacks, and edits keyboards to keep only `Open html`.
-- `src/telegram/callbacks.rs` owns RAM-only callback keys (`mark:<key>`), page/token lookup, and the callback loop. Until poll loop is wired, the runtime loop is active but the store is not populated automatically.
+- `src/telegram/callbacks.rs` owns RAM-only callback keys (`mark:<key>`), page/token lookup, and the callback loop. The Rust poll loop now populates callback mappings for new messages.
 - Legacy `pkg/telegram/telegram.go` and callback code in `cmd/mailpuff/main.go` remain behavior references for orchestration wiring.
 - When mail becomes read, keyboard should be edited to remove `Mark as read` and keep only `Open html`.
 
@@ -78,7 +79,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `README.md` - env variables, viewer behavior, security notes, known limitations.
 - `src/config.rs` - Rust env contract and validation behavior.
 - `src/mail_source` - provider-neutral source model for IMAP and future custom providers.
-- `src/state.rs` and `src/orchestration.rs` - RAM-only indices and shared mark-read flow.
+- `src/state.rs` and `src/orchestration.rs` - RAM-only indices, poll loop MVP, and shared mark-read flow.
 - `src/email` - Rust email summary parsing and MIME fallback tests.
 - `src/viewer` - Rust viewer store, sanitizer, HTTP routes, and tests.
 - `src/telegram` - Rust Telegram formatting, callback store, callback handler, and callback tests.

@@ -711,7 +711,8 @@ Manual E2E:
 
 Текущий прогресс:
 
-* 5.1 реализован: provider-neutral RAM `RuntimeState` и общий mark-read service для HTTP и Telegram. Poll loop, auto-hide, first-view mark-seen, cleanup loop и coordinated shutdown остаются pending.
+* 5.1 реализован: provider-neutral RAM `RuntimeState` и общий mark-read service для HTTP и Telegram.
+* 5.2 реализован: poll loop MVP через `MailSource` создаёт viewer page/callback, отправляет Telegram message и обновляет RAM indices. Auto-hide, first-view mark-seen, cleanup loop и coordinated shutdown остаются pending.
 
 ### Phase 6 — Hardening
 

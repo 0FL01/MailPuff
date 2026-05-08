@@ -1,21 +1,270 @@
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
+use thiserror::Error;
 use url::Url;
 
 use crate::{
-    mail_source::MailSource,
-    state::RuntimeState,
+    email::parser::parse_email_summary,
+    mail_source::{MailSource, MessageRef},
+    state::{RuntimeState, RuntimeStateError},
     telegram::{
-        CallbackStore,
+        CallbackStore, SendEmailMessage, TelegramBot, TelegramError, TelegramMessageRef,
         callbacks::{CallbackTelegramApi, build_viewer_url},
     },
     viewer::{
         http::{MarkReadError, MarkReadHandler, MarkReadResult},
-        store::AuthorizedPage,
+        store::{AuthorizedPage, CreatePageOptions, PageStore},
     },
 };
+
+#[async_trait]
+pub trait EmailTelegramApi: Send + Sync {
+    async fn send_email_message(
+        &self,
+        request: SendEmailMessage<'_>,
+    ) -> Result<TelegramMessageRef, SendTelegramError>;
+}
+
+#[async_trait]
+impl EmailTelegramApi for TelegramBot {
+    async fn send_email_message(
+        &self,
+        request: SendEmailMessage<'_>,
+    ) -> Result<TelegramMessageRef, SendTelegramError> {
+        Ok(TelegramBot::send_email_message(self, request).await?)
+    }
+}
+
+pub struct PollService {
+    mail_source: Arc<dyn MailSource>,
+    page_store: Arc<PageStore>,
+    state: Arc<RuntimeState>,
+    callback_store: Arc<CallbackStore>,
+    telegram: Arc<dyn EmailTelegramApi>,
+    viewer_url_base: Url,
+}
+
+impl PollService {
+    #[must_use]
+    pub fn new(
+        mail_source: Arc<dyn MailSource>,
+        page_store: Arc<PageStore>,
+        state: Arc<RuntimeState>,
+        callback_store: Arc<CallbackStore>,
+        telegram: Arc<dyn EmailTelegramApi>,
+        viewer_url_base: Url,
+    ) -> Self {
+        Self {
+            mail_source,
+            page_store,
+            state,
+            callback_store,
+            telegram,
+            viewer_url_base,
+        }
+    }
+
+    pub async fn poll_once(&self) -> Result<PollCycleStats, PollError> {
+        let unread = self.mail_source.list_unread().await?;
+        let mut stats = PollCycleStats {
+            unread: unread.len(),
+            ..PollCycleStats::default()
+        };
+
+        for message in unread {
+            self.process_unread_message(message, &mut stats).await?;
+        }
+
+        Ok(stats)
+    }
+
+    async fn process_unread_message(
+        &self,
+        message: MessageRef,
+        stats: &mut PollCycleStats,
+    ) -> Result<(), PollError> {
+        if self.state.is_processed(&message)? {
+            stats.skipped_processed += 1;
+            return Ok(());
+        }
+
+        let raw = match self.mail_source.fetch(&message).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                stats.fetch_errors += 1;
+                tracing::error!(
+                    source = %message.source,
+                    stable_id = %message.stable_id,
+                    %error,
+                    "mail fetch failed"
+                );
+                return Ok(());
+            }
+        };
+        let mail_ref = raw.source_ref.clone();
+
+        let email = match parse_email_summary(&raw.bytes) {
+            Ok(email) => email,
+            Err(error) => {
+                stats.parse_errors += 1;
+                let _ = self.state.mark_processed(mail_ref.clone())?;
+                tracing::error!(
+                    source = %mail_ref.source,
+                    stable_id = %mail_ref.stable_id,
+                    %error,
+                    "email parse failed; message marked processed"
+                );
+                return Ok(());
+            }
+        };
+
+        let Some(html_body) = email
+            .html_body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+        else {
+            stats.skipped_no_body += 1;
+            let _ = self.state.mark_processed(mail_ref.clone())?;
+            tracing::info!(
+                source = %mail_ref.source,
+                stable_id = %mail_ref.stable_id,
+                "email skipped without body; message marked processed"
+            );
+            return Ok(());
+        };
+
+        let page = match self.page_store.create_page_with_options(
+            html_body,
+            CreatePageOptions {
+                mail_ref: Some(mail_ref.clone()),
+            },
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                stats.store_errors += 1;
+                tracing::error!(
+                    source = %mail_ref.source,
+                    stable_id = %mail_ref.stable_id,
+                    %error,
+                    "viewer page creation failed"
+                );
+                return Ok(());
+            }
+        };
+
+        let callback = match self.callback_store.create(page.id, page.token.clone()) {
+            Ok(callback) => callback,
+            Err(error) => {
+                stats.callback_errors += 1;
+                self.delete_created_page(page.id);
+                tracing::error!(
+                    source = %mail_ref.source,
+                    stable_id = %mail_ref.stable_id,
+                    %error,
+                    "telegram callback creation failed"
+                );
+                return Ok(());
+            }
+        };
+
+        let viewer_url =
+            build_viewer_url(&self.viewer_url_base, page.id, page.token.expose_secret());
+        let telegram_ref = match self
+            .telegram
+            .send_email_message(SendEmailMessage {
+                email: &email,
+                viewer_url,
+                mark_callback_data: callback.callback_data,
+            })
+            .await
+        {
+            Ok(telegram_ref) => telegram_ref,
+            Err(error) => {
+                stats.telegram_errors += 1;
+                self.delete_callback_and_page(page.id);
+                tracing::error!(
+                    source = %mail_ref.source,
+                    stable_id = %mail_ref.stable_id,
+                    %error,
+                    "telegram send failed"
+                );
+                return Ok(());
+            }
+        };
+
+        let _ = self.state.mark_processed(mail_ref.clone())?;
+        self.state
+            .track_message(mail_ref.clone(), page.id, telegram_ref)?;
+        stats.processed += 1;
+
+        tracing::info!(
+            source = %mail_ref.source,
+            stable_id = %mail_ref.stable_id,
+            telegram_chat_id = telegram_ref.chat_id,
+            telegram_message_id = telegram_ref.message_id,
+            "mail message sent to telegram"
+        );
+
+        Ok(())
+    }
+
+    fn delete_callback_and_page(&self, page_id: uuid::Uuid) {
+        if let Err(error) = self.callback_store.delete_page(page_id) {
+            tracing::error!(%error, "failed to cleanup callback after poll error");
+        }
+        self.delete_created_page(page_id);
+    }
+
+    fn delete_created_page(&self, page_id: uuid::Uuid) {
+        if let Err(error) = self.page_store.delete(page_id) {
+            tracing::error!(%error, "failed to cleanup viewer page after poll error");
+        }
+    }
+}
+
+pub async fn run_poll_loop(service: PollService, poll_interval: Duration) {
+    loop {
+        match service.poll_once().await {
+            Ok(stats) => tracing::info!(?stats, "mail poll cycle completed"),
+            Err(error) => tracing::error!(%error, "mail poll cycle failed"),
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PollCycleStats {
+    pub unread: usize,
+    pub processed: usize,
+    pub skipped_processed: usize,
+    pub skipped_no_body: usize,
+    pub fetch_errors: usize,
+    pub parse_errors: usize,
+    pub store_errors: usize,
+    pub callback_errors: usize,
+    pub telegram_errors: usize,
+}
+
+#[derive(Debug, Error)]
+pub enum PollError {
+    #[error(transparent)]
+    App(#[from] crate::error::Error),
+
+    #[error(transparent)]
+    RuntimeState(#[from] RuntimeStateError),
+}
+
+#[derive(Debug, Error)]
+pub enum SendTelegramError {
+    #[error(transparent)]
+    Telegram(#[from] TelegramError),
+
+    #[error("telegram send failed: {0}")]
+    Backend(String),
+}
 
 pub struct MarkReadService {
     mail_source: Arc<dyn MailSource>,
@@ -111,12 +360,18 @@ fn backend_error(error: impl fmt::Display) -> MarkReadError {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, time::Instant};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Mutex,
+        time::{Duration, Instant},
+    };
 
     use crate::{
+        config::ViewerRemoteImages,
         error::{Error, Result},
         mail_source::{MailSourceCapabilities, MailSourceKind, MessageRef, RawEmail},
         telegram::{TelegramError, TelegramMessageRef},
+        viewer::store::PageStoreConfig,
     };
 
     use secrecy::SecretString;
@@ -125,18 +380,56 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeMailSource {
+        unread: Mutex<Vec<MessageRef>>,
+        raw: Mutex<HashMap<MessageRef, Vec<u8>>>,
+        fetch_failures: Mutex<HashSet<MessageRef>>,
+        fetched: Mutex<Vec<MessageRef>>,
         marked: Mutex<Vec<MessageRef>>,
         fail_mark_read: bool,
+    }
+
+    impl FakeMailSource {
+        fn set_unread(&self, messages: Vec<MessageRef>) {
+            *self.unread.lock().expect("unread lock") = messages;
+        }
+
+        fn set_raw(&self, message: MessageRef, raw: impl Into<Vec<u8>>) {
+            self.raw
+                .lock()
+                .expect("raw lock")
+                .insert(message, raw.into());
+        }
     }
 
     #[async_trait]
     impl MailSource for FakeMailSource {
         async fn list_unread(&self) -> Result<Vec<MessageRef>> {
-            Ok(Vec::new())
+            Ok(self.unread.lock().expect("unread lock").clone())
         }
 
         async fn fetch(&self, message: &MessageRef) -> Result<RawEmail> {
-            Ok(RawEmail::new(Vec::new(), message.clone()))
+            self.fetched
+                .lock()
+                .expect("fetched lock")
+                .push(message.clone());
+            if self
+                .fetch_failures
+                .lock()
+                .expect("fetch failures lock")
+                .contains(message)
+            {
+                return Err(Error::NotImplemented("fake fetch failure"));
+            }
+
+            Ok(RawEmail::new(
+                self.raw
+                    .lock()
+                    .expect("raw lock")
+                    .get(message)
+                    .cloned()
+                    .unwrap_or_default(),
+                message.clone(),
+            ))
         }
 
         async fn mark_read(&self, message: &MessageRef) -> Result<()> {
@@ -159,6 +452,15 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeTelegram {
         edits: Mutex<Vec<(TelegramMessageRef, Url)>>,
+        sent: Mutex<Vec<SentEmail>>,
+        fail_send: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SentEmail {
+        subject: String,
+        viewer_url: Url,
+        mark_callback_data: String,
     }
 
     #[async_trait]
@@ -184,6 +486,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl EmailTelegramApi for FakeTelegram {
+        async fn send_email_message(
+            &self,
+            request: SendEmailMessage<'_>,
+        ) -> std::result::Result<TelegramMessageRef, SendTelegramError> {
+            if self.fail_send {
+                return Err(SendTelegramError::Backend("boom".to_owned()));
+            }
+
+            let mut sent = self.sent.lock().expect("sent lock");
+            sent.push(SentEmail {
+                subject: request.email.subject.clone(),
+                viewer_url: request.viewer_url,
+                mark_callback_data: request.mark_callback_data,
+            });
+
+            Ok(TelegramMessageRef::new(100, 200 + sent.len() as i32))
+        }
+    }
+
     fn mail_ref() -> MessageRef {
         MessageRef::new(
             MailSourceKind::Imap,
@@ -191,6 +514,51 @@ mod tests {
             Some("INBOX".to_owned()),
             "42",
         )
+    }
+
+    fn mail_ref_with_id(stable_id: &str) -> MessageRef {
+        MessageRef::new(
+            MailSourceKind::Imap,
+            "imap.example.com",
+            Some("INBOX".to_owned()),
+            stable_id,
+        )
+    }
+
+    fn html_email(subject: &str) -> Vec<u8> {
+        format!(
+            "From: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nSubject: {subject}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hello</p>"
+        )
+        .into_bytes()
+    }
+
+    fn no_body_email() -> Vec<u8> {
+        b"From: Alice <alice@example.com>\r\nSubject: Empty\r\n\r\n".to_vec()
+    }
+
+    fn page_store() -> Arc<PageStore> {
+        Arc::new(PageStore::new(PageStoreConfig {
+            page_ttl: Duration::from_secs(60),
+            page_max_views: Some(3),
+            remote_images: ViewerRemoteImages::Allow,
+        }))
+    }
+
+    fn poll_service(
+        mail_source: Arc<FakeMailSource>,
+        page_store: Arc<PageStore>,
+        state: Arc<RuntimeState>,
+        callback_store: Arc<CallbackStore>,
+        telegram: Arc<FakeTelegram>,
+    ) -> std::result::Result<PollService, url::ParseError> {
+        Ok(PollService::new(
+            mail_source,
+            page_store,
+            state,
+            callback_store,
+            telegram,
+            Url::parse("https://mail.example.com/view")?,
+        ))
     }
 
     fn authorized_page(page_id: uuid::Uuid, mail_ref: MessageRef) -> AuthorizedPage {
@@ -257,8 +625,8 @@ mod tests {
         let mail_ref = mail_ref();
         let telegram_ref = TelegramMessageRef::new(100, 200);
         let mail_source = Arc::new(FakeMailSource {
-            marked: Mutex::new(Vec::new()),
             fail_mark_read: true,
+            ..FakeMailSource::default()
         });
         let state = Arc::new(RuntimeState::new());
         let callback_store = Arc::new(CallbackStore::new());
@@ -280,6 +648,151 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(state.tracked_len()?, 1);
         assert!(callback_store.lookup(&callback.key)?.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_sends_new_email_and_tracks_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let mail_source = Arc::new(FakeMailSource::default());
+        mail_source.set_unread(vec![mail_ref.clone()]);
+        mail_source.set_raw(mail_ref.clone(), html_email("Hello"));
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            Arc::clone(&page_store),
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(
+            stats,
+            PollCycleStats {
+                unread: 1,
+                processed: 1,
+                ..PollCycleStats::default()
+            }
+        );
+        assert!(state.is_processed(&mail_ref)?);
+        let tracked = state.get_tracked(&mail_ref)?.expect("tracked message");
+        assert_eq!(tracked.telegram_ref, TelegramMessageRef::new(100, 201));
+        assert_eq!(callback_store.len()?, 1);
+        assert!(callback_store.lookup_page(tracked.page_id)?.is_some());
+        assert_eq!(page_store.len()?, 1);
+
+        let sent = telegram.sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].subject, "Hello");
+        assert_eq!(sent[0].viewer_url.path(), "/view");
+        assert!(
+            sent[0]
+                .viewer_url
+                .query()
+                .is_some_and(|query| { query.contains("id=") && query.contains("token=") })
+        );
+        assert!(sent[0].mark_callback_data.starts_with("mark:"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_does_not_mark_processed_when_telegram_send_fails()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let mail_source = Arc::new(FakeMailSource::default());
+        mail_source.set_unread(vec![mail_ref.clone()]);
+        mail_source.set_raw(mail_ref.clone(), html_email("Hello"));
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram {
+            edits: Mutex::new(Vec::new()),
+            sent: Mutex::new(Vec::new()),
+            fail_send: true,
+        });
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            Arc::clone(&page_store),
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.unread, 1);
+        assert_eq!(stats.telegram_errors, 1);
+        assert!(!state.is_processed(&mail_ref)?);
+        assert_eq!(state.tracked_len()?, 0);
+        assert!(callback_store.is_empty()?);
+        assert!(page_store.is_empty()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_already_processed_without_fetch()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let mail_source = Arc::new(FakeMailSource::default());
+        mail_source.set_unread(vec![mail_ref.clone()]);
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            page_store,
+            Arc::clone(&state),
+            callback_store,
+            telegram,
+        )?;
+        let _ = state.mark_processed(mail_ref)?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.unread, 1);
+        assert_eq!(stats.skipped_processed, 1);
+        assert!(mail_source.fetched.lock().expect("fetched lock").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_marks_no_body_email_processed_without_sending()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref_with_id("43");
+        let mail_source = Arc::new(FakeMailSource::default());
+        mail_source.set_unread(vec![mail_ref.clone()]);
+        mail_source.set_raw(mail_ref.clone(), no_body_email());
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            Arc::clone(&page_store),
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.unread, 1);
+        assert_eq!(stats.skipped_no_body, 1);
+        assert!(state.is_processed(&mail_ref)?);
+        assert!(telegram.sent.lock().expect("sent lock").is_empty());
+        assert!(callback_store.is_empty()?);
+        assert!(page_store.is_empty()?);
 
         Ok(())
     }

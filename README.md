@@ -2,7 +2,7 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state и mark-read service. Poll loop остаётся в Go-коде как reference до следующей фазы миграции.
+> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service и poll loop MVP. Auto-hide, first-view mark-seen и cleanup loop остаются следующими шагами.
 
 ## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
@@ -110,7 +110,7 @@ TZ=UTC
 
 ## Типовые сценарии
 - Изменить лимиты: укажите `VIEWER_PAGE_TTL` и/или `VIEWER_PAGE_MAX_VIEWS` в `.env`.
-- Помечать письма прочитанными только при открытии: установите `IMAP_MARK_SEEN=true` — отметка произойдёт на событии первого открытия HTML.
+- Помечать письма прочитанными только при открытии: `IMAP_MARK_SEEN=true` уже загружается конфигом, но first-view mark-seen ещё не подключён в Rust runtime.
 - Работа через HTTPS: рекомендуем публиковать viewer за обратным прокси и выставить `VIEWER_URL_BASE` с `https`.
 
 ## Заметки безопасности
@@ -119,6 +119,6 @@ TZ=UTC
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
-- Rust runtime пока содержит viewer HTTP, Telegram callback loop и mark-read foundation, но ещё не содержит poll loop, который создаёт viewer pages и отправляет новые Telegram messages.
+- Rust poll loop уже создаёт viewer pages и отправляет новые Telegram messages; auto-hide external read, first-view mark-seen и cleanup loop ещё не подключены.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).

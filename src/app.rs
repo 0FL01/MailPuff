@@ -4,7 +4,7 @@ use crate::{
     config::{Config, MailSourceConfig},
     error::{Error, Result},
     mail_source::{MailSource, imap::ImapSource},
-    orchestration::MarkReadService,
+    orchestration::{EmailTelegramApi, MarkReadService, PollService, run_poll_loop},
     shutdown,
     state::RuntimeState,
     telegram::{
@@ -40,6 +40,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mail_source = build_mail_source(&config.mail_source);
     let telegram_bot = Arc::new(TelegramBot::new(&config.telegram));
     let telegram_api: Arc<dyn CallbackTelegramApi> = telegram_bot.clone();
+    let telegram_sender: Arc<dyn EmailTelegramApi> = telegram_bot.clone();
     let mark_read_handler: Arc<dyn MarkReadHandler> = Arc::new(MarkReadService::new(
         Arc::clone(&mail_source),
         Arc::clone(&runtime_state),
@@ -71,12 +72,28 @@ pub async fn run(config: Config) -> Result<()> {
             .await;
         }
     });
+    let poll_task = tokio::spawn({
+        let poll_service = PollService::new(
+            Arc::clone(&mail_source),
+            Arc::clone(&page_store),
+            Arc::clone(&runtime_state),
+            Arc::clone(&callback_store),
+            telegram_sender,
+            config.viewer.url_base.clone(),
+        );
+        let poll_interval = mail_poll_interval(&config.mail_source);
+
+        async move {
+            info!(?poll_interval, "mail poll loop started");
+            run_poll_loop(poll_service, poll_interval).await;
+        }
+    });
     let bind_addr = normalize_http_addr(&config.http.addr);
     let listener = TcpListener::bind(&bind_addr).await?;
 
     info!(
         bind_addr = %bind_addr,
-        "viewer HTTP listener started; mail polling is not active yet"
+        "viewer HTTP listener started"
     );
 
     axum::serve(listener, http::router(viewer_state))
@@ -93,6 +110,12 @@ pub async fn run(config: Config) -> Result<()> {
     {
         tracing::error!(%error, "telegram callback task failed during shutdown");
     }
+    poll_task.abort();
+    if let Err(error) = poll_task.await
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "mail poll task failed during shutdown");
+    }
 
     info!("shutdown complete");
 
@@ -108,6 +131,12 @@ fn normalize_http_addr(addr: &str) -> String {
 fn build_mail_source(config: &MailSourceConfig) -> Arc<dyn MailSource> {
     match config {
         MailSourceConfig::Imap(imap) => Arc::new(ImapSource::new(imap.clone())),
+    }
+}
+
+fn mail_poll_interval(config: &MailSourceConfig) -> std::time::Duration {
+    match config {
+        MailSourceConfig::Imap(imap) => imap.poll_interval,
     }
 }
 
