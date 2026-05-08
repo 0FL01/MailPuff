@@ -91,6 +91,21 @@ impl CallbackStore {
             .cloned())
     }
 
+    pub fn lookup_page(
+        &self,
+        page_id: Uuid,
+    ) -> Result<Option<MarkCallbackPayload>, CallbackStoreError> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| CallbackStoreError::LockPoisoned)?;
+        let Some(key) = inner.page_to_key.get(&page_id) else {
+            return Ok(None);
+        };
+
+        Ok(inner.by_key.get(key).cloned())
+    }
+
     pub fn delete_key(&self, key: &str) -> Result<Option<MarkCallbackPayload>, CallbackStoreError> {
         let mut inner = self
             .inner
@@ -277,27 +292,36 @@ pub async fn handle_mark_callback(
         return Ok(MarkCallbackOutcome::LinkExpiredOrInvalid);
     };
 
-    if mark_read.mark_read(page).await.is_err() {
+    let mark_read_result = match mark_read.mark_read(page).await {
+        Ok(result) => result,
+        Err(_) => {
+            telegram
+                .answer_callback(&event.callback_id, "Failed to mark as read")
+                .await?;
+            return Ok(MarkCallbackOutcome::FailedToMarkRead);
+        }
+    };
+
+    if !mark_read_result.keyboard_hidden {
         telegram
-            .answer_callback(&event.callback_id, "Failed to mark as read")
+            .edit_open_only_keyboard(
+                message,
+                build_viewer_url(
+                    viewer_url_base,
+                    payload.page_id,
+                    payload.token.expose_secret(),
+                ),
+            )
             .await?;
-        return Ok(MarkCallbackOutcome::FailedToMarkRead);
+    }
+
+    if !mark_read_result.callback_deleted {
+        callback_store.delete_key(key)?;
     }
 
     telegram
         .answer_callback(&event.callback_id, "Marked as read")
         .await?;
-    telegram
-        .edit_open_only_keyboard(
-            message,
-            build_viewer_url(
-                viewer_url_base,
-                payload.page_id,
-                payload.token.expose_secret(),
-            ),
-        )
-        .await?;
-    callback_store.delete_key(key)?;
 
     Ok(MarkCallbackOutcome::MarkedRead)
 }
@@ -368,14 +392,21 @@ pub fn parse_mark_callback_key(data: &str) -> Result<&str, CallbackDataError> {
         return Err(CallbackDataError::NotMarkCallback);
     };
 
-    if is_valid_callback_key(key) {
-        Ok(key)
-    } else {
-        Err(CallbackDataError::InvalidMarkKey)
+    if !is_valid_callback_key(key) {
+        return Err(CallbackDataError::InvalidMarkKey);
     }
+
+    Ok(key)
 }
 
-#[must_use]
+fn is_valid_callback_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_CALLBACK_KEY_BYTES
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 pub fn build_viewer_url(base: &Url, id: Uuid, token: &str) -> Url {
     let mut url = base.clone();
     let existing_pairs = url
@@ -404,25 +435,16 @@ fn generate_callback_key() -> Result<String, CallbackStoreError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn is_valid_callback_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= MAX_CALLBACK_KEY_BYTES
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
 #[cfg(test)]
 mod tests {
     use std::{sync::Mutex, time::Duration};
 
-    use async_trait::async_trait;
     use secrecy::ExposeSecret;
 
     use crate::{
         config::ViewerRemoteImages,
         mail_source::{MailSourceKind, MessageRef},
-        viewer::http::MarkReadError,
+        viewer::http::{MarkReadError, MarkReadResult},
         viewer::store::{AuthorizedPage, CreatePageOptions, PageStoreConfig},
     };
 
@@ -468,9 +490,9 @@ mod tests {
 
     #[async_trait]
     impl MarkReadHandler for OkMarkRead {
-        async fn mark_read(&self, _page: AuthorizedPage) -> Result<(), MarkReadError> {
+        async fn mark_read(&self, _page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError> {
             *self.calls.lock().expect("calls lock") += 1;
-            Ok(())
+            Ok(MarkReadResult::default())
         }
     }
 
@@ -479,8 +501,29 @@ mod tests {
 
     #[async_trait]
     impl MarkReadHandler for FailingMarkRead {
-        async fn mark_read(&self, _page: AuthorizedPage) -> Result<(), MarkReadError> {
+        async fn mark_read(&self, _page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError> {
             Err(MarkReadError::Backend("boom".to_owned()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct SideEffectMarkRead {
+        callback_store: Arc<CallbackStore>,
+    }
+
+    #[async_trait]
+    impl MarkReadHandler for SideEffectMarkRead {
+        async fn mark_read(&self, page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError> {
+            let callback_deleted = self
+                .callback_store
+                .delete_page(page.id)
+                .map_err(|error| MarkReadError::Backend(error.to_string()))?
+                .is_some();
+
+            Ok(MarkReadResult {
+                keyboard_hidden: true,
+                callback_deleted,
+            })
         }
     }
 
@@ -522,6 +565,14 @@ mod tests {
         let payload = store.lookup(&callback.key)?.expect("payload exists");
         assert_eq!(payload.page_id, page_id);
         assert_eq!(payload.token.expose_secret(), "secret-token");
+        assert_eq!(
+            store
+                .lookup_page(page_id)?
+                .expect("page payload")
+                .token
+                .expose_secret(),
+            "secret-token"
+        );
 
         Ok(())
     }
@@ -621,6 +672,45 @@ mod tests {
                 page.id,
                 page.token.expose_secret()
             )
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_callback_skips_duplicate_side_effects() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let page_store = page_store(Duration::from_secs(60));
+        let callback_store = Arc::new(CallbackStore::new());
+        let page = page_store.create_page_with_options(
+            "<p>Hello</p>",
+            CreatePageOptions {
+                mail_ref: Some(mail_ref()),
+            },
+        )?;
+        let callback = callback_store.create(page.id, page.token.clone())?;
+        let telegram = FakeTelegram::default();
+        let mark_read = SideEffectMarkRead {
+            callback_store: Arc::clone(&callback_store),
+        };
+        let viewer_url_base = Url::parse("https://mail.example.com/view")?;
+
+        let outcome = handle_mark_callback(
+            event(callback.callback_data.clone()),
+            &page_store,
+            callback_store.as_ref(),
+            &mark_read,
+            &telegram,
+            &viewer_url_base,
+        )
+        .await?;
+
+        assert_eq!(outcome, MarkCallbackOutcome::MarkedRead);
+        assert!(callback_store.lookup(&callback.key)?.is_none());
+        assert!(telegram.edits.lock().expect("edits lock").is_empty());
+        assert_eq!(
+            telegram.answers.lock().expect("answers lock").as_slice(),
+            ["Marked as read"]
         );
 
         Ok(())

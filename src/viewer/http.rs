@@ -49,7 +49,7 @@ pub fn router(state: ViewerHttpState) -> Router {
 
 #[async_trait]
 pub trait MarkReadHandler: Send + Sync + 'static {
-    async fn mark_read(&self, page: AuthorizedPage) -> Result<(), MarkReadError>;
+    async fn mark_read(&self, page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError>;
 }
 
 #[derive(Debug, Default)]
@@ -57,9 +57,15 @@ pub struct NoopMarkReadHandler;
 
 #[async_trait]
 impl MarkReadHandler for NoopMarkReadHandler {
-    async fn mark_read(&self, _page: AuthorizedPage) -> Result<(), MarkReadError> {
+    async fn mark_read(&self, _page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError> {
         Err(MarkReadError::NotConfigured)
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkReadResult {
+    pub keyboard_hidden: bool,
+    pub callback_deleted: bool,
 }
 
 #[derive(Debug, Error)]
@@ -114,7 +120,7 @@ async fn mark_read(
     }
 
     match state.mark_read.mark_read(page).await {
-        Ok(()) => plain_text(StatusCode::OK, "OK"),
+        Ok(_) => plain_text(StatusCode::OK, "OK"),
         Err(MarkReadError::NotConfigured) => StatusCode::NOT_IMPLEMENTED.into_response(),
         Err(error) => {
             error!(%id, %error, "mark-read backend failed");
@@ -205,8 +211,8 @@ mod tests {
 
     #[async_trait]
     impl MarkReadHandler for OkMarkReadHandler {
-        async fn mark_read(&self, _page: AuthorizedPage) -> Result<(), MarkReadError> {
-            Ok(())
+        async fn mark_read(&self, _page: AuthorizedPage) -> Result<MarkReadResult, MarkReadError> {
+            Ok(MarkReadResult::default())
         }
     }
 

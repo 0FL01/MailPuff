@@ -709,6 +709,10 @@ Manual E2E:
 * Implement cleanup loop.
 * Implement graceful shutdown.
 
+Текущий прогресс:
+
+* 5.1 реализован: provider-neutral RAM `RuntimeState` и общий mark-read service для HTTP и Telegram. Poll loop, auto-hide, first-view mark-seen, cleanup loop и coordinated shutdown остаются pending.
+
 ### Phase 6 — Hardening
 
 * Security headers.

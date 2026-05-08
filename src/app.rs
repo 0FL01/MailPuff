@@ -3,10 +3,16 @@ use std::sync::Arc;
 use crate::{
     config::{Config, MailSourceConfig},
     error::{Error, Result},
+    mail_source::{MailSource, imap::ImapSource},
+    orchestration::MarkReadService,
     shutdown,
-    telegram::{TelegramBot, callbacks::CallbackStore},
+    state::RuntimeState,
+    telegram::{
+        TelegramBot,
+        callbacks::{CallbackStore, CallbackTelegramApi},
+    },
     viewer::{
-        http::{self, MarkReadHandler, NoopMarkReadHandler, ViewerHttpState},
+        http::{self, MarkReadHandler, ViewerHttpState},
         store::{PageStore, PageStoreConfig},
     },
 };
@@ -30,13 +36,22 @@ pub async fn run(config: Config) -> Result<()> {
 
     let page_store = Arc::new(PageStore::new(PageStoreConfig::from(&config.viewer)));
     let callback_store = Arc::new(CallbackStore::new());
-    let mark_read_handler: Arc<dyn MarkReadHandler> = Arc::new(NoopMarkReadHandler);
+    let runtime_state = Arc::new(RuntimeState::new());
+    let mail_source = build_mail_source(&config.mail_source);
+    let telegram_bot = Arc::new(TelegramBot::new(&config.telegram));
+    let telegram_api: Arc<dyn CallbackTelegramApi> = telegram_bot.clone();
+    let mark_read_handler: Arc<dyn MarkReadHandler> = Arc::new(MarkReadService::new(
+        Arc::clone(&mail_source),
+        Arc::clone(&runtime_state),
+        Arc::clone(&callback_store),
+        telegram_api,
+        config.viewer.url_base.clone(),
+    ));
     let viewer_state = ViewerHttpState::new(
         Arc::clone(&page_store),
         config.viewer.remote_images,
         Arc::clone(&mark_read_handler),
     );
-    let telegram_bot = Arc::new(TelegramBot::new(&config.telegram));
     let telegram_task = tokio::spawn({
         let telegram_bot = Arc::clone(&telegram_bot);
         let page_store = Arc::clone(&page_store);
@@ -88,6 +103,12 @@ fn normalize_http_addr(addr: &str) -> String {
     addr.strip_prefix(':')
         .map(|port| format!("0.0.0.0:{port}"))
         .unwrap_or_else(|| addr.to_owned())
+}
+
+fn build_mail_source(config: &MailSourceConfig) -> Arc<dyn MailSource> {
+    match config {
+        MailSourceConfig::Imap(imap) => Arc::new(ImapSource::new(imap.clone())),
+    }
 }
 
 fn log_startup(config: &Config) {
