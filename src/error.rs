@@ -7,6 +7,12 @@ pub enum Error {
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
 
+    #[error(transparent)]
+    EmailParse(#[from] crate::email::parser::EmailParseError),
+
+    #[error(transparent)]
+    ImapSource(#[from] crate::mail_source::imap::ImapSourceError),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

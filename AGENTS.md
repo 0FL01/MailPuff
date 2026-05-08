@@ -7,7 +7,8 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 ## Workspace Overview
 - `src/main.rs` - thin Rust entrypoint: config load, tracing init, top-level run.
 - `src/config.rs` - typed env parsing, defaults, fail-fast validation, secret redaction.
-- `src/mail_source` - provider-neutral mail source boundary; IMAP is the first backend, Proton custom is reserved.
+- `src/mail_source` - provider-neutral mail source boundary; async IMAP is the first backend, Proton custom is reserved.
+- `src/email` - Rust RFC822/MIME parsing into `EmailSummary`; prefers HTML and falls back to escaped text.
 - `src/viewer` - Rust in-memory page store, sanitizer, and axum `/view` + `/mark_read` routes.
 - `cmd/mailpuff/main.go` - legacy Go reference for orchestration behavior during migration.
 - `pkg/config` - environment parsing, defaults, required variable validation.
@@ -38,12 +39,13 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 
 ### IMAP Polling
 - Rust migration should route polling through `src/mail_source::MailSource`, not directly through IMAP-specific state.
+- `src/mail_source/imap.rs` implements connect/login/select, `UID SEARCH UNSEEN`, `UID FETCH RFC822`, and `+FLAGS (\Seen)` mark-read.
 - Legacy main loop lives in `cmd/mailpuff/main.go`; it reconnects each poll, searches `UNSEEN`, fetches emails, skips already processed UIDs, and sleeps `IMAP_POLL_INTERVAL`.
 - IMAP operations are isolated in `pkg/imap/imap.go`; use those wrappers instead of calling the library directly from new code.
 - `IMAP_FORCE_RECONNECT` is loaded in config but is not currently used by the polling logic.
 
 ### Email Parsing
-- `pkg/email/email.go` builds `Summary` with subject, sender fields, date, and HTML body.
+- `src/email/parser.rs` builds `EmailSummary` from raw RFC822 bytes using `mail-parser`.
 - If HTML is missing, `text/plain` is escaped and wrapped in `<pre>`; emails with no HTML/text body are skipped by `cmd/mailpuff/main.go`.
 
 ### Viewer
@@ -71,6 +73,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `README.md` - env variables, viewer behavior, security notes, known limitations.
 - `src/config.rs` - Rust env contract and validation behavior.
 - `src/mail_source` - provider-neutral source model for IMAP and future custom providers.
+- `src/email` - Rust email summary parsing and MIME fallback tests.
 - `src/viewer` - Rust viewer store, sanitizer, HTTP routes, and tests.
 - `cmd/mailpuff/main.go` - legacy end-to-end data flow and Telegram/IMAP/viewer integration.
 - `pkg/viewer/viewer.go` - HTTP routes, token checks, TTL/max-view logic.

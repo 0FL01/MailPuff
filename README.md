@@ -2,7 +2,7 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP. IMAP polling и Telegram loop остаются в Go-коде как reference до следующих фаз миграции.
+> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser и IMAP backend. Poll loop и Telegram loop остаются в Go-коде как reference до следующих фаз миграции.
 
 ## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
@@ -119,6 +119,6 @@ TZ=UTC
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
-- Rust runtime пока содержит viewer HTTP без IMAP polling и Telegram loop.
+- Rust runtime пока содержит viewer HTTP и IMAP/email building blocks без poll loop и Telegram loop.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).
