@@ -22,6 +22,3 @@ target/
 *.swp
 *.swo
 .DS_Store
-
-# Tests
-**/*_test.go
