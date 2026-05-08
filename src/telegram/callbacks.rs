@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use secrecy::{ExposeSecret, SecretString};
 use teloxide::{dispatching::Dispatcher, dptree, prelude::*, types::CallbackQuery};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -332,11 +333,12 @@ pub async fn run_callback_loop(
     callback_store: Arc<CallbackStore>,
     mark_read: Arc<dyn MarkReadHandler>,
     viewer_url_base: Url,
+    shutdown: CancellationToken,
 ) {
     let raw_bot = bot.raw().clone();
     let handler = Update::filter_callback_query().endpoint(handle_teloxide_callback);
 
-    Dispatcher::builder(raw_bot, handler)
+    let mut dispatcher = Dispatcher::builder(raw_bot, handler)
         .dependencies(dptree::deps![
             bot,
             page_store,
@@ -344,9 +346,12 @@ pub async fn run_callback_loop(
             mark_read,
             viewer_url_base
         ])
-        .build()
-        .dispatch()
-        .await;
+        .build();
+
+    tokio::select! {
+        () = shutdown.cancelled() => tracing::info!("telegram callback loop shutdown requested"),
+        () = dispatcher.dispatch() => tracing::info!("telegram callback loop stopped"),
+    }
 }
 
 async fn handle_teloxide_callback(

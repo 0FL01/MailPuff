@@ -57,6 +57,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/viewer/sanitize.rs` uses Ammonia allowlist sanitization; scripts and event handlers must remain blocked.
 - `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views, and `/view` triggers first-view mark-seen when enabled.
 - `src/orchestration.rs` provides the real mark-read handler used by HTTP, first-view, and Telegram paths plus cleanup loop side effects for expired/max-view deleted pages.
+- `src/app.rs` coordinates HTTP, Telegram, poll, and cleanup shutdown through a shared cancellation token.
 
 ### Telegram
 - `src/telegram/bot.rs` formats Telegram HTML messages, sends `Open html` + `Mark as read`, answers callbacks, and edits keyboards to keep only `Open html`.

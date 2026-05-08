@@ -715,7 +715,8 @@ Manual E2E:
 * 5.2 реализован: poll loop MVP через `MailSource` создаёт viewer page/callback, отправляет Telegram message и обновляет RAM indices.
 * 5.3 реализован: auto-hide external read сравнивает current unread set с tracked messages, скрывает `Mark as read` и чистит callback/tracked mappings; failed Telegram edit ретраится на следующем poll.
 * 5.4 реализован: first-view mark-seen при `IMAP_MARK_SEEN=true` запускает общий mark-read flow после первого успешного `/view` без блокировки HTML response.
-* 5.5 реализован: cleanup loop удаляет expired pages и чистит callback/tracked mappings; max-view deletion также запускает page deletion side effects. Coordinated shutdown остаётся pending.
+* 5.5 реализован: cleanup loop удаляет expired pages и чистит callback/tracked mappings; max-view deletion также запускает page deletion side effects.
+* 5.6 реализован: coordinated shutdown через общий cancellation token останавливает HTTP graceful shutdown, Telegram callback loop, poll loop и cleanup loop без `abort()`.
 
 ### Phase 6 — Hardening
 

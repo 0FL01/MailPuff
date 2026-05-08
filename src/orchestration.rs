@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
@@ -312,15 +313,27 @@ impl PollService {
     }
 }
 
-pub async fn run_poll_loop(service: PollService, poll_interval: Duration) {
+pub async fn run_poll_loop(
+    service: PollService,
+    poll_interval: Duration,
+    shutdown: CancellationToken,
+) {
     loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
         match service.poll_once().await {
             Ok(stats) => tracing::info!(?stats, "mail poll cycle completed"),
             Err(error) => tracing::error!(%error, "mail poll cycle failed"),
         }
 
-        tokio::time::sleep(poll_interval).await;
+        if wait_for_interval_or_shutdown(poll_interval, &shutdown).await {
+            break;
+        }
     }
+
+    tracing::info!("mail poll loop stopped");
 }
 
 pub struct CleanupService {
@@ -388,14 +401,33 @@ impl PageDeletionHandler for CleanupService {
     }
 }
 
-pub async fn run_cleanup_loop(service: Arc<CleanupService>, cleanup_interval: Duration) {
+pub async fn run_cleanup_loop(
+    service: Arc<CleanupService>,
+    cleanup_interval: Duration,
+    shutdown: CancellationToken,
+) {
     loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
         match service.cleanup_expired_once() {
             Ok(stats) => tracing::info!(?stats, "viewer cleanup cycle completed"),
             Err(error) => tracing::error!(%error, "viewer cleanup cycle failed"),
         }
 
-        tokio::time::sleep(cleanup_interval).await;
+        if wait_for_interval_or_shutdown(cleanup_interval, &shutdown).await {
+            break;
+        }
+    }
+
+    tracing::info!("viewer cleanup loop stopped");
+}
+
+async fn wait_for_interval_or_shutdown(interval: Duration, shutdown: &CancellationToken) -> bool {
+    tokio::select! {
+        () = shutdown.cancelled() => true,
+        () = tokio::time::sleep(interval) => false,
     }
 }
 
@@ -896,6 +928,21 @@ mod tests {
         assert_eq!(state.tracked_len()?, 0);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn loop_interval_wait_exits_when_shutdown_is_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        assert!(wait_for_interval_or_shutdown(Duration::from_secs(60), &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn loop_interval_wait_continues_after_sleep() {
+        let shutdown = CancellationToken::new();
+
+        assert!(!wait_for_interval_or_shutdown(Duration::from_millis(1), &shutdown).await);
     }
 
     #[test]

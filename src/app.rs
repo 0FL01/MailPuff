@@ -19,7 +19,8 @@ use crate::{
         store::{PageStore, PageStoreConfig},
     },
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -64,12 +65,14 @@ pub async fn run(config: Config) -> Result<()> {
         page_deleted_handler,
         mail_mark_seen_on_first_view(&config.mail_source),
     );
+    let shutdown_token = CancellationToken::new();
     let telegram_task = tokio::spawn({
         let telegram_bot = Arc::clone(&telegram_bot);
         let page_store = Arc::clone(&page_store);
         let callback_store = Arc::clone(&callback_store);
         let mark_read_handler = Arc::clone(&mark_read_handler);
         let viewer_url_base = config.viewer.url_base.clone();
+        let shutdown = shutdown_token.child_token();
 
         async move {
             info!("telegram callback loop started");
@@ -79,6 +82,7 @@ pub async fn run(config: Config) -> Result<()> {
                 callback_store,
                 mark_read_handler,
                 viewer_url_base,
+                shutdown,
             )
             .await;
         }
@@ -93,19 +97,21 @@ pub async fn run(config: Config) -> Result<()> {
             config.viewer.url_base.clone(),
         );
         let poll_interval = mail_poll_interval(&config.mail_source);
+        let shutdown = shutdown_token.child_token();
 
         async move {
             info!(?poll_interval, "mail poll loop started");
-            run_poll_loop(poll_service, poll_interval).await;
+            run_poll_loop(poll_service, poll_interval, shutdown).await;
         }
     });
     let cleanup_task = tokio::spawn({
         let cleanup_service = Arc::clone(&cleanup_service);
         let cleanup_interval = cleanup_interval(config.viewer.page_ttl);
+        let shutdown = shutdown_token.child_token();
 
         async move {
             info!(?cleanup_interval, "viewer cleanup loop started");
-            run_cleanup_loop(cleanup_service, cleanup_interval).await;
+            run_cleanup_loop(cleanup_service, cleanup_interval, shutdown).await;
         }
     });
     let bind_addr = normalize_http_addr(&config.http.addr);
@@ -116,36 +122,43 @@ pub async fn run(config: Config) -> Result<()> {
         "viewer HTTP listener started"
     );
 
-    axum::serve(listener, http::router(viewer_state))
-        .with_graceful_shutdown(async {
-            if let Err(error) = shutdown::wait_for_signal().await {
+    let http_shutdown = shutdown_token.clone();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, http::router(viewer_state))
+            .with_graceful_shutdown(http_shutdown.cancelled_owned()),
+    );
+    tokio::pin!(server);
+
+    let server_result = tokio::select! {
+        result = &mut server => result,
+        signal_result = shutdown::wait_for_signal() => {
+            if let Err(error) = signal_result {
                 tracing::error!(%error, "failed while waiting for shutdown signal");
             }
-        })
-        .await?;
+            shutdown_token.cancel();
+            server.as_mut().await
+        }
+    };
 
-    telegram_task.abort();
-    if let Err(error) = telegram_task.await
-        && !error.is_cancelled()
-    {
-        tracing::error!(%error, "telegram callback task failed during shutdown");
-    }
-    poll_task.abort();
-    if let Err(error) = poll_task.await
-        && !error.is_cancelled()
-    {
-        tracing::error!(%error, "mail poll task failed during shutdown");
-    }
-    cleanup_task.abort();
-    if let Err(error) = cleanup_task.await
-        && !error.is_cancelled()
-    {
-        tracing::error!(%error, "viewer cleanup task failed during shutdown");
-    }
+    shutdown_token.cancel();
+    await_task("telegram callback", telegram_task).await;
+    await_task("mail poll", poll_task).await;
+    await_task("viewer cleanup", cleanup_task).await;
+
+    server_result?;
 
     info!("shutdown complete");
 
     Ok(())
+}
+
+async fn await_task(name: &'static str, task: JoinHandle<()>) {
+    match task.await {
+        Ok(()) => info!(task = name, "background task stopped"),
+        Err(error) => {
+            tracing::error!(task = name, %error, "background task failed during shutdown")
+        }
+    }
 }
 
 fn normalize_http_addr(addr: &str) -> String {

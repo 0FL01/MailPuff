@@ -2,7 +2,7 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service, poll loop MVP, auto-hide external read, first-view mark-seen и cleanup loop. Coordinated shutdown остаётся следующим шагом.
+> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service, poll loop MVP, auto-hide external read, first-view mark-seen, cleanup loop и coordinated shutdown. Следующий шаг — Phase 6 hardening.
 
 ## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
@@ -119,6 +119,6 @@ TZ=UTC
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
-- Coordinated graceful shutdown для фоновых задач ещё требует hardening.
+- Phase 6 hardening ещё pending: финальная проверка secret-safe logs, docs и release checks.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).
