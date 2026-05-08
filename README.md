@@ -2,7 +2,7 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-> Статус миграции: ветка `rust` сейчас содержит Rust viewer store/HTTP, email parser, IMAP backend, Telegram callback loop, RAM-only orchestration state, mark-read service, poll loop MVP, auto-hide external read, first-view mark-seen, cleanup loop и coordinated shutdown. Следующий шаг — Phase 6 hardening.
+> Статус миграции: ветка `rust` содержит Rust runtime с IMAP poll loop, Telegram callbacks, RAM-only orchestration state, viewer cleanup, coordinated shutdown и Phase 6 hardening. Остался live E2E smoke с реальными IMAP/Telegram credentials перед релизом.
 
 ## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
@@ -65,6 +65,8 @@ docker run -d \
 - `RUST_LOG` (info) — фильтр structured logging
 - `TZ` — часовой пояс контейнера (например, `Europe/Moscow`)
 
+Пустые значения явно заданных optional env переменных считаются ошибкой конфигурации; чтобы использовать default, не задавайте переменную.
+
 ## Пример `.env`
 ```
 # IMAP
@@ -77,6 +79,7 @@ IMAP_TLS=true
 IMAP_ACCEPT_INVALID_CERTS=false
 IMAP_MAILBOX=INBOX
 IMAP_POLL_INTERVAL=60s
+IMAP_FORCE_RECONNECT=60s
 IMAP_MARK_SEEN=false
 
 # Telegram
@@ -88,9 +91,10 @@ TELEGRAM_CHAT_ID=-1001234567890
 HTTP_ADDR=:8080
 # Укажите полный базовый URL именно на путь /view
 # Примеры:
-#   локально:  http://localhost:8080/view
+#   docker compose: http://127.0.0.1:82/view
+#   docker run:     http://localhost:8080/view
 #   за прокси: https://mail.example.com/view
-VIEWER_URL_BASE=http://localhost:8080/view
+VIEWER_URL_BASE=http://127.0.0.1:82/view
 VIEWER_PAGE_TTL=48h
 VIEWER_PAGE_MAX_VIEWS=3
 VIEWER_REMOTE_IMAGES=allow
@@ -103,9 +107,10 @@ TZ=UTC
 ```
 
 ## Маршруты и поведение viewer
-- HTTP‑сервер слушает `HTTP_ADDR` (по умолчанию `:8080`), в Docker пробрасывается на хост `8080:8080`.
+- HTTP‑сервер слушает `HTTP_ADDR` (по умолчанию `:8080`); текущий `docker-compose.yml` публикует его как `127.0.0.1:82`.
 - Основной маршрут: `/view?id=<UUID>&token=<TOKEN>` — возвращает HTML письма при валидном токене.
 - Санитизация HTML: используется allowlist-политика Ammonia для защиты от XSS; при отсутствии `HTML` содержимое `text/plain` заворачивается в безопасный `<pre>`.
+- Viewer responses выставляют `nosniff`, `Referrer-Policy: no-referrer`, `X-Robots-Tag: noindex, nofollow`, CSP, `X-Frame-Options: DENY` и `Cache-Control: no-store`.
 - TTL и лимит просмотров: после первого успешного открытия счётчик увеличивается; при достижении лимита страница удаляется из памяти после ответа. По истечении TTL cleanup loop удаляет страницу и RAM mappings.
 
 ## Типовые сценарии
@@ -116,9 +121,10 @@ TZ=UTC
 ## Заметки безопасности
 - `IMAP_TLS=true` настоятельно рекомендуется. `IMAP_TLS=false` в Rust-версии является legacy compatibility mode и не должен молча включать plaintext IMAP.
 - `IMAP_ACCEPT_INVALID_CERTS=true` отключает проверку TLS‑сертификата IMAP и должен использоваться только осознанно.
+- Logs redaction покрывает core secrets: IMAP password, Telegram token, viewer token, callback payload/key и тело email не выводятся через `Debug`/runtime logs.
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
-- Phase 6 hardening ещё pending: финальная проверка secret-safe logs, docs и release checks.
+- Live E2E smoke с реальными IMAP/Telegram credentials перед релизом ещё нужно выполнить вручную.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).

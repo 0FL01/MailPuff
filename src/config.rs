@@ -36,7 +36,7 @@ impl Config {
     }
 
     pub fn from_env_map(vars: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
-        let mail_source_value = optional_string(vars, "MAIL_SOURCE", DEFAULT_MAIL_SOURCE);
+        let mail_source_value = optional_string(vars, "MAIL_SOURCE", DEFAULT_MAIL_SOURCE)?;
         let mail_source_kind = parse_mail_source_kind("MAIL_SOURCE", &mail_source_value)?;
 
         let mail_source = match mail_source_kind {
@@ -52,9 +52,9 @@ impl Config {
         Ok(Self {
             mail_source,
             telegram: TelegramConfig::from_env_map(vars)?,
-            http: HttpConfig::from_env_map(vars),
+            http: HttpConfig::from_env_map(vars)?,
             viewer: ViewerConfig::from_env_map(vars)?,
-            log_filter: optional_string(vars, "RUST_LOG", DEFAULT_RUST_LOG),
+            log_filter: optional_string(vars, "RUST_LOG", DEFAULT_RUST_LOG)?,
         })
     }
 }
@@ -93,13 +93,13 @@ impl ImapConfig {
             host: required_string(vars, "IMAP_HOST")?,
             port: parse_u16(
                 "IMAP_PORT",
-                &optional_string(vars, "IMAP_PORT", DEFAULT_IMAP_PORT),
+                &optional_string(vars, "IMAP_PORT", DEFAULT_IMAP_PORT)?,
             )?,
             username: required_string(vars, "IMAP_USERNAME")?,
             password: SecretString::from(required_string(vars, "IMAP_PASSWORD")?),
             use_tls: parse_bool(
                 "IMAP_TLS",
-                &optional_string(vars, "IMAP_TLS", DEFAULT_IMAP_TLS),
+                &optional_string(vars, "IMAP_TLS", DEFAULT_IMAP_TLS)?,
             )?,
             accept_invalid_certs: parse_bool(
                 "IMAP_ACCEPT_INVALID_CERTS",
@@ -107,20 +107,20 @@ impl ImapConfig {
                     vars,
                     "IMAP_ACCEPT_INVALID_CERTS",
                     DEFAULT_IMAP_ACCEPT_INVALID_CERTS,
-                ),
+                )?,
             )?,
-            mailbox: optional_string(vars, "IMAP_MAILBOX", DEFAULT_IMAP_MAILBOX),
+            mailbox: optional_string(vars, "IMAP_MAILBOX", DEFAULT_IMAP_MAILBOX)?,
             poll_interval: parse_positive_duration(
                 "IMAP_POLL_INTERVAL",
-                &optional_string(vars, "IMAP_POLL_INTERVAL", DEFAULT_IMAP_POLL_INTERVAL),
+                &optional_string(vars, "IMAP_POLL_INTERVAL", DEFAULT_IMAP_POLL_INTERVAL)?,
             )?,
             force_reconnect: parse_positive_duration(
                 "IMAP_FORCE_RECONNECT",
-                &optional_string(vars, "IMAP_FORCE_RECONNECT", DEFAULT_IMAP_FORCE_RECONNECT),
+                &optional_string(vars, "IMAP_FORCE_RECONNECT", DEFAULT_IMAP_FORCE_RECONNECT)?,
             )?,
             mark_seen: parse_bool(
                 "IMAP_MARK_SEEN",
-                &optional_string(vars, "IMAP_MARK_SEEN", DEFAULT_IMAP_MARK_SEEN),
+                &optional_string(vars, "IMAP_MARK_SEEN", DEFAULT_IMAP_MARK_SEEN)?,
             )?,
         })
     }
@@ -187,10 +187,10 @@ pub struct HttpConfig {
 }
 
 impl HttpConfig {
-    fn from_env_map(vars: &BTreeMap<String, String>) -> Self {
-        Self {
-            addr: optional_string(vars, "HTTP_ADDR", DEFAULT_HTTP_ADDR),
-        }
+    fn from_env_map(vars: &BTreeMap<String, String>) -> Result<Self, ConfigError> {
+        Ok(Self {
+            addr: optional_string(vars, "HTTP_ADDR", DEFAULT_HTTP_ADDR)?,
+        })
     }
 }
 
@@ -211,15 +211,15 @@ impl ViewerConfig {
             )?,
             page_ttl: parse_positive_duration(
                 "VIEWER_PAGE_TTL",
-                &optional_string(vars, "VIEWER_PAGE_TTL", DEFAULT_VIEWER_PAGE_TTL),
+                &optional_string(vars, "VIEWER_PAGE_TTL", DEFAULT_VIEWER_PAGE_TTL)?,
             )?,
             page_max_views: parse_max_views(
                 "VIEWER_PAGE_MAX_VIEWS",
-                &optional_string(vars, "VIEWER_PAGE_MAX_VIEWS", DEFAULT_VIEWER_PAGE_MAX_VIEWS),
+                &optional_string(vars, "VIEWER_PAGE_MAX_VIEWS", DEFAULT_VIEWER_PAGE_MAX_VIEWS)?,
             )?,
             remote_images: parse_remote_images(
                 "VIEWER_REMOTE_IMAGES",
-                &optional_string(vars, "VIEWER_REMOTE_IMAGES", DEFAULT_VIEWER_REMOTE_IMAGES),
+                &optional_string(vars, "VIEWER_REMOTE_IMAGES", DEFAULT_VIEWER_REMOTE_IMAGES)?,
             )?,
         })
     }
@@ -264,12 +264,20 @@ fn required_string(
     }
 }
 
-fn optional_string(vars: &BTreeMap<String, String>, key: &'static str, default: &str) -> String {
-    vars.get(key)
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(default)
-        .to_owned()
+fn optional_string(
+    vars: &BTreeMap<String, String>,
+    key: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    match vars.get(key).map(|value| value.trim()) {
+        Some("") => Err(invalid_value(
+            key,
+            "",
+            "a non-empty value or unset to use default",
+        )),
+        Some(value) => Ok(value.to_owned()),
+        None => Ok(default.to_owned()),
+    }
 }
 
 fn parse_mail_source_kind(key: &'static str, value: &str) -> Result<MailSourceKind, ConfigError> {
@@ -491,6 +499,20 @@ mod tests {
             Config::from_env_map(&vars),
             Err(ConfigError::InvalidValue {
                 key: "IMAP_POLL_INTERVAL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_optional_env_fails_fast() {
+        let mut vars = base_env();
+        vars.insert("VIEWER_PAGE_TTL".to_owned(), "  ".to_owned());
+
+        assert!(matches!(
+            Config::from_env_map(&vars),
+            Err(ConfigError::InvalidValue {
+                key: "VIEWER_PAGE_TTL",
                 ..
             })
         ));

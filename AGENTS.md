@@ -34,6 +34,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - Message deduplication must remain process-local; after restart, old unseen messages can be processed again.
 - Never bypass `src/viewer` sanitization when storing or serving email HTML; legacy `pkg/viewer` remains reference only.
 - Viewer URLs must include both `id` and `token`; do not log tokens, and keep page IDs masked in logs.
+- Token-bearing `Debug` output must stay redacted for viewer URLs, callback keys/payloads, Telegram token, IMAP password, and email bodies.
 - `IMAP_TLS=false` is legacy compatibility mode; plaintext IMAP must not be enabled silently. Use `IMAP_ACCEPT_INVALID_CERTS=true` only with explicit warning.
 - Telegram messages are not deleted when viewer pages expire; only the in-memory page is removed.
 - `.env` is ignored and may contain secrets. Avoid reading it unless explicitly required.
@@ -56,6 +57,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/viewer/store.rs` owns Rust page lifecycle: create, authorize, view count, TTL expiry, and max-view deletion.
 - `src/viewer/sanitize.rs` uses Ammonia allowlist sanitization; scripts and event handlers must remain blocked.
 - `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views, and `/view` triggers first-view mark-seen when enabled.
+- Viewer responses carry no-store cache directives, no-referrer, noindex/nofollow, nosniff, CSP, and `X-Frame-Options: DENY` headers.
 - `src/orchestration.rs` provides the real mark-read handler used by HTTP, first-view, and Telegram paths plus cleanup loop side effects for expired/max-view deleted pages.
 - `src/app.rs` coordinates HTTP, Telegram, poll, and cleanup shutdown through a shared cancellation token.
 

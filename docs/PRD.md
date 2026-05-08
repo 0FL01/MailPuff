@@ -717,14 +717,11 @@ Manual E2E:
 * 5.4 реализован: first-view mark-seen при `IMAP_MARK_SEEN=true` запускает общий mark-read flow после первого успешного `/view` без блокировки HTML response.
 * 5.5 реализован: cleanup loop удаляет expired pages и чистит callback/tracked mappings; max-view deletion также запускает page deletion side effects.
 * 5.6 реализован: coordinated shutdown через общий cancellation token останавливает HTTP graceful shutdown, Telegram callback loop, poll loop и cleanup loop без `abort()`.
+* 6 реализован: добавлены no-store/security headers на viewer responses, secret-safe Debug/logging для token-bearing типов, strict fail-fast для пустых optional env и обновлены README/`.env.example`.
 
 ### Phase 6 — Hardening
 
-* Security headers.
-* Secret-safe logs.
-* Invalid config fail-fast.
-* Clippy/test/docs.
-* Update README and `.env.example`.
+Статус: реализовано. Финальный release gate — локальные проверки, Docker build и live E2E smoke с реальными IMAP/Telegram credentials.
 
 ## 15. Open product decisions
 

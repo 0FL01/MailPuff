@@ -155,10 +155,20 @@ impl CallbackStore {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct CallbackStoreInner {
     by_key: HashMap<String, MarkCallbackPayload>,
     page_to_key: HashMap<Uuid, String>,
+}
+
+impl fmt::Debug for CallbackStoreInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallbackStoreInner")
+            .field("by_key_len", &self.by_key.len())
+            .field("page_to_key_len", &self.page_to_key.len())
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -177,10 +187,20 @@ impl fmt::Debug for MarkCallbackPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreatedCallback {
     pub key: String,
     pub callback_data: String,
+}
+
+impl fmt::Debug for CreatedCallback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreatedCallback")
+            .field("key", &"[REDACTED]")
+            .field("callback_data", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -195,11 +215,22 @@ pub enum CallbackStoreError {
     LockPoisoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MarkCallbackEvent {
     pub callback_id: String,
     pub data: Option<String>,
     pub message: Option<TelegramMessageRef>,
+}
+
+impl fmt::Debug for MarkCallbackEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MarkCallbackEvent")
+            .field("callback_id", &"[REDACTED]")
+            .field("data", &self.data.as_ref().map(|_| "[REDACTED]"))
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 impl MarkCallbackEvent {
@@ -236,6 +267,16 @@ pub enum MarkCallbackError {
 
     #[error(transparent)]
     Telegram(#[from] TelegramError),
+}
+
+impl MarkCallbackError {
+    const fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::CallbackStore(_) => "callback_store",
+            Self::Store(_) => "page_store",
+            Self::Telegram(error) => error.safe_kind(),
+        }
+    }
 }
 
 pub async fn handle_mark_callback(
@@ -375,7 +416,10 @@ async fn handle_teloxide_callback(
     {
         Ok(MarkCallbackOutcome::Ignored) => {}
         Ok(outcome) => tracing::info!(?outcome, "telegram mark-read callback handled"),
-        Err(error) => tracing::error!(%error, "telegram mark-read callback failed"),
+        Err(error) => tracing::error!(
+            error_kind = error.safe_kind(),
+            "telegram mark-read callback failed"
+        ),
     }
 
     Ok(())
@@ -595,6 +639,30 @@ mod tests {
         assert!(store.delete_page(second_page_id)?.is_some());
         assert!(store.lookup(&second.key)?.is_none());
         assert!(store.is_empty()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn callback_debug_redacts_keys_and_data() -> Result<(), Box<dyn std::error::Error>> {
+        let store = CallbackStore::new();
+        let callback = store.create(
+            Uuid::new_v4(),
+            SecretString::from("secret-token".to_owned()),
+        )?;
+        let event = event(callback.callback_data.clone());
+
+        let callback_debug = format!("{callback:?}");
+        let event_debug = format!("{event:?}");
+        let store_debug = format!("{store:?}");
+
+        assert!(callback_debug.contains("[REDACTED]"));
+        assert!(!callback_debug.contains(&callback.key));
+        assert!(!callback_debug.contains(&callback.callback_data));
+        assert!(event_debug.contains("[REDACTED]"));
+        assert!(!event_debug.contains(&callback.callback_data));
+        assert!(!store_debug.contains(&callback.key));
+        assert!(!store_debug.contains("secret-token"));
 
         Ok(())
     }

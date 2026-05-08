@@ -126,8 +126,8 @@ async fn view(State(state): State<ViewerHttpState>, Query(query): Query<PageQuer
         }
         Ok(PageAccess::Denied(_)) => not_found(),
         Err(error) => {
-            error!(%id, %error, "viewer store failed while serving page");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            error!(page_id = %masked_uuid(id), %error, "viewer store failed while serving page");
+            status_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -179,7 +179,7 @@ fn trigger_first_view_mark_read(
             Err(error) => tracing::error!(
                 source = %mail_ref.source,
                 stable_id = %mail_ref.stable_id,
-                %error,
+                error_kind = error.safe_kind(),
                 "first-view mark-read failed"
             ),
         }
@@ -205,7 +205,7 @@ fn handle_deleted_page(handler: &dyn PageDeletionHandler, page: DeletedPage) {
         Err(error) => tracing::error!(
             page_id = %masked_uuid(page_id),
             reason = ?reason,
-            %error,
+            error_kind = error.safe_kind(),
             "viewer page deletion side effects failed"
         ),
     }
@@ -223,8 +223,8 @@ async fn mark_read(
         Ok(PageAccess::Granted(page)) => page,
         Ok(PageAccess::Denied(_)) => return not_found(),
         Err(error) => {
-            error!(%id, %error, "viewer store failed while authorizing mark-read");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            error!(page_id = %masked_uuid(id), %error, "viewer store failed while authorizing mark-read");
+            return status_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
@@ -234,10 +234,10 @@ async fn mark_read(
 
     match state.mark_read.mark_read(page).await {
         Ok(_) => plain_text(StatusCode::OK, "OK"),
-        Err(MarkReadError::NotConfigured) => StatusCode::NOT_IMPLEMENTED.into_response(),
+        Err(MarkReadError::NotConfigured) => status_response(StatusCode::NOT_IMPLEMENTED),
         Err(error) => {
-            error!(%id, %error, "mark-read backend failed");
-            StatusCode::BAD_GATEWAY.into_response()
+            error!(page_id = %masked_uuid(id), error_kind = error.safe_kind(), "mark-read backend failed");
+            status_response(StatusCode::BAD_GATEWAY)
         }
     }
 }
@@ -251,12 +251,38 @@ fn parse_page_query(query: PageQuery) -> Option<(Uuid, String)> {
 
 fn html_response(html: String, remote_images: ViewerRemoteImages) -> Response {
     let mut response = Html(html).into_response();
-    let headers = response.headers_mut();
-
-    headers.insert(
+    response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    apply_security_headers(&mut response, content_security_policy(remote_images));
+
+    response
+}
+
+fn plain_text(status: StatusCode, body: &'static str) -> Response {
+    let mut response = (status, body).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    apply_security_headers(&mut response, default_content_security_policy());
+    response
+}
+
+fn status_response(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    apply_security_headers(&mut response, default_content_security_policy());
+    response
+}
+
+fn not_found() -> Response {
+    status_response(StatusCode::NOT_FOUND)
+}
+
+fn apply_security_headers(response: &mut Response, content_security_policy: &'static str) {
+    let headers = response.headers_mut();
+
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -270,24 +296,19 @@ fn html_response(html: String, remote_images: ViewerRemoteImages) -> Response {
         HeaderValue::from_static("noindex, nofollow"),
     );
     headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_static(content_security_policy(remote_images)),
+        HeaderValue::from_static(content_security_policy),
     );
-
-    response
-}
-
-fn plain_text(status: StatusCode, body: &'static str) -> Response {
-    let mut response = (status, body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response
-}
-
-fn not_found() -> Response {
-    StatusCode::NOT_FOUND.into_response()
 }
 
 pub(crate) fn masked_uuid(id: Uuid) -> String {
@@ -302,6 +323,27 @@ const fn content_security_policy(remote_images: ViewerRemoteImages) -> &'static 
         }
         ViewerRemoteImages::Block => {
             "default-src 'none'; img-src data: cid:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        }
+    }
+}
+
+const fn default_content_security_policy() -> &'static str {
+    "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+}
+
+impl MarkReadError {
+    const fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Backend(_) => "backend",
+        }
+    }
+}
+
+impl PageDeletionError {
+    const fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::Backend(_) => "backend",
         }
     }
 }
@@ -447,6 +489,49 @@ mod tests {
         Ok(String::from_utf8(bytes.to_vec())?)
     }
 
+    fn assert_security_headers(response: &Response, csp: &'static str) {
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("referrer-policy")),
+            Some(&HeaderValue::from_static("no-referrer"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-robots-tag")),
+            Some(&HeaderValue::from_static("noindex, nofollow"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("x-frame-options")),
+            Some(&HeaderValue::from_static("DENY"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store, max-age=0"))
+        );
+        assert_eq!(
+            response.headers().get(header::PRAGMA),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        assert_eq!(
+            response.headers().get(header::EXPIRES),
+            Some(&HeaderValue::from_static("0"))
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(HeaderName::from_static("content-security-policy")),
+            Some(&HeaderValue::from_static(csp))
+        );
+    }
+
     #[tokio::test]
     async fn view_returns_sanitized_html_and_security_headers()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -468,20 +553,45 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
-            Some(&HeaderValue::from_static("nosniff"))
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/html; charset=utf-8"))
         );
-        assert_eq!(
-            response
-                .headers()
-                .get(HeaderName::from_static("referrer-policy")),
-            Some(&HeaderValue::from_static("no-referrer"))
+        assert_security_headers(
+            &response,
+            content_security_policy(ViewerRemoteImages::Allow),
         );
 
         let body = body_string(response).await?;
         assert!(body.contains("<p>Hello</p>"));
         assert!(!body.contains("onclick"));
         assert!(!body.contains("script"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn view_uses_block_remote_image_csp() -> Result<(), Box<dyn std::error::Error>> {
+        let store = page_store(Some(3));
+        let page = store.create_page("<p>Hello</p>")?;
+        let app = router(ViewerHttpState::new(
+            store,
+            ViewerRemoteImages::Block,
+            Arc::new(NoopMarkReadHandler),
+            Arc::new(NoopPageDeletionHandler),
+            false,
+        ));
+
+        let response = send(
+            app,
+            format!("/view?id={}&token={}", page.id, page.token.expose_secret()),
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_security_headers(
+            &response,
+            content_security_policy(ViewerRemoteImages::Block),
+        );
 
         Ok(())
     }
@@ -501,6 +611,7 @@ mod tests {
         let response = send(app, format!("/view?id={}&token=wrong", page.id)).await?;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_security_headers(&response, default_content_security_policy());
 
         Ok(())
     }
@@ -720,6 +831,11 @@ mod tests {
         )
         .await?;
         assert_eq!(mark_response.status(), StatusCode::OK);
+        assert_eq!(
+            mark_response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        assert_security_headers(&mark_response, default_content_security_policy());
 
         let view_response = send(
             app,
@@ -727,6 +843,40 @@ mod tests {
         )
         .await?;
         assert_eq!(view_response.status(), StatusCode::OK);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mark_read_backend_failure_has_security_headers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = page_store(Some(1));
+        let page = store.create_page_with_options(
+            "<p>Hello</p>",
+            CreatePageOptions {
+                mail_ref: Some(mail_ref()),
+            },
+        )?;
+        let app = router(ViewerHttpState::new(
+            store,
+            ViewerRemoteImages::Allow,
+            Arc::new(RecordingMarkReadHandler::new(true)),
+            Arc::new(NoopPageDeletionHandler),
+            false,
+        ));
+
+        let response = send(
+            app,
+            format!(
+                "/mark_read?id={}&token={}",
+                page.id,
+                page.token.expose_secret()
+            ),
+        )
+        .await?;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_security_headers(&response, default_content_security_policy());
 
         Ok(())
     }

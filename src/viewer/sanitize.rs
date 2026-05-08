@@ -81,4 +81,31 @@ mod tests {
         assert!(sanitized.contains("<img"));
         assert!(!sanitized.contains("https://example.com"));
     }
+
+    #[test]
+    fn strips_dangerous_url_schemes() {
+        let sanitizer = HtmlSanitizer::new(ViewerRemoteImages::Allow);
+
+        let sanitized = sanitizer.sanitize(
+            "<a href=\"JaVaScRiPt:alert(1)\">link</a><img src=\"javascript:alert(1)\" alt=\"x\">",
+        );
+
+        assert!(sanitized.contains(">link</a>"));
+        assert!(sanitized.contains("<img"));
+        assert!(!sanitized.to_ascii_lowercase().contains("javascript:"));
+    }
+
+    #[test]
+    fn strips_active_content_tags() {
+        let sanitizer = HtmlSanitizer::new(ViewerRemoteImages::Allow);
+
+        let sanitized = sanitizer.sanitize(
+            "<iframe src=\"https://example.com\"></iframe><form><input name=\"x\"></form><p>ok</p>",
+        );
+
+        assert!(sanitized.contains("<p>ok</p>"));
+        assert!(!sanitized.contains("<iframe"));
+        assert!(!sanitized.contains("<form"));
+        assert!(!sanitized.contains("<input"));
+    }
 }

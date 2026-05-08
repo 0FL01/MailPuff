@@ -195,7 +195,7 @@ impl PollService {
                 tracing::error!(
                     source = %mail_ref.source,
                     stable_id = %mail_ref.stable_id,
-                    %error,
+                    error_kind = error.safe_kind(),
                     "telegram send failed"
                 );
                 return Ok(());
@@ -265,7 +265,7 @@ impl PollService {
             tracing::error!(
                 source = %tracked.mail_ref.source,
                 stable_id = %tracked.mail_ref.stable_id,
-                %error,
+                error_kind = error.safe_kind(),
                 "failed to auto-hide telegram mark-read button"
             );
             return Ok(());
@@ -494,6 +494,15 @@ pub enum SendTelegramError {
 
     #[error("telegram send failed: {0}")]
     Backend(String),
+}
+
+impl SendTelegramError {
+    const fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::Telegram(error) => error.safe_kind(),
+            Self::Backend(_) => "backend",
+        }
+    }
 }
 
 pub struct MarkReadService {

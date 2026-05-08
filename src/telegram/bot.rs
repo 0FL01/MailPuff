@@ -109,11 +109,45 @@ impl CallbackTelegramApi for TelegramBot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SendEmailMessage<'a> {
     pub email: &'a EmailSummary,
     pub viewer_url: Url,
     pub mark_callback_data: String,
+}
+
+impl fmt::Debug for SendEmailMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SendEmailMessage")
+            .field("email", self.email)
+            .field("viewer_url", &RedactedViewerUrl(&self.viewer_url))
+            .field("mark_callback_data", &"[REDACTED]")
+            .finish()
+    }
+}
+
+struct RedactedViewerUrl<'a>(&'a Url);
+
+impl fmt::Debug for RedactedViewerUrl<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut url = self.0.clone();
+        let redacted_pairs = url
+            .query_pairs()
+            .map(|(key, value)| {
+                let value = if key == "token" {
+                    "[REDACTED]".into()
+                } else {
+                    value
+                };
+                (key.into_owned(), value.into_owned())
+            })
+            .collect::<Vec<_>>();
+
+        url.query_pairs_mut().clear().extend_pairs(redacted_pairs);
+
+        fmt::Debug::fmt(url.as_str(), formatter)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,6 +173,16 @@ pub enum TelegramError {
 
     #[error("Telegram backend failed: {0}")]
     Backend(String),
+}
+
+impl TelegramError {
+    #[must_use]
+    pub const fn safe_kind(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::Backend(_) => "backend",
+        }
+    }
 }
 
 #[must_use]
@@ -209,6 +253,23 @@ mod tests {
             date: None,
             html_body: Some("<p>Hello</p>".to_owned()),
         }
+    }
+
+    #[test]
+    fn send_email_message_debug_redacts_tokens() -> Result<(), url::ParseError> {
+        let request = SendEmailMessage {
+            email: &email_summary(),
+            viewer_url: Url::parse("https://mail.example.com/view?id=1&token=secret-token")?,
+            mark_callback_data: "mark:secret-callback".to_owned(),
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("secret-callback"));
+
+        Ok(())
     }
 
     #[test]
