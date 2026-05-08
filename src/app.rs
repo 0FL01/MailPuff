@@ -4,8 +4,9 @@ use crate::{
     config::{Config, MailSourceConfig},
     error::{Error, Result},
     shutdown,
+    telegram::{TelegramBot, callbacks::CallbackStore},
     viewer::{
-        http::{self, NoopMarkReadHandler, ViewerHttpState},
+        http::{self, MarkReadHandler, NoopMarkReadHandler, ViewerHttpState},
         store::{PageStore, PageStoreConfig},
     },
 };
@@ -28,17 +29,39 @@ pub async fn run(config: Config) -> Result<()> {
     log_startup(&config);
 
     let page_store = Arc::new(PageStore::new(PageStoreConfig::from(&config.viewer)));
+    let callback_store = Arc::new(CallbackStore::new());
+    let mark_read_handler: Arc<dyn MarkReadHandler> = Arc::new(NoopMarkReadHandler);
     let viewer_state = ViewerHttpState::new(
-        page_store,
+        Arc::clone(&page_store),
         config.viewer.remote_images,
-        Arc::new(NoopMarkReadHandler),
+        Arc::clone(&mark_read_handler),
     );
+    let telegram_bot = Arc::new(TelegramBot::new(&config.telegram));
+    let telegram_task = tokio::spawn({
+        let telegram_bot = Arc::clone(&telegram_bot);
+        let page_store = Arc::clone(&page_store);
+        let callback_store = Arc::clone(&callback_store);
+        let mark_read_handler = Arc::clone(&mark_read_handler);
+        let viewer_url_base = config.viewer.url_base.clone();
+
+        async move {
+            info!("telegram callback loop started");
+            crate::telegram::callbacks::run_callback_loop(
+                telegram_bot,
+                page_store,
+                callback_store,
+                mark_read_handler,
+                viewer_url_base,
+            )
+            .await;
+        }
+    });
     let bind_addr = normalize_http_addr(&config.http.addr);
     let listener = TcpListener::bind(&bind_addr).await?;
 
     info!(
         bind_addr = %bind_addr,
-        "viewer HTTP listener started; mail polling and telegram loops are not active yet"
+        "viewer HTTP listener started; mail polling is not active yet"
     );
 
     axum::serve(listener, http::router(viewer_state))
@@ -48,6 +71,13 @@ pub async fn run(config: Config) -> Result<()> {
             }
         })
         .await?;
+
+    telegram_task.abort();
+    if let Err(error) = telegram_task.await
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "telegram callback task failed during shutdown");
+    }
 
     info!("shutdown complete");
 

@@ -10,6 +10,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/mail_source` - provider-neutral mail source boundary; async IMAP is the first backend, Proton custom is reserved.
 - `src/email` - Rust RFC822/MIME parsing into `EmailSummary`; prefers HTML and falls back to escaped text.
 - `src/viewer` - Rust in-memory page store, sanitizer, and axum `/view` + `/mark_read` routes.
+- `src/telegram` - Rust Telegram Bot API boundary, message formatter, keyboard edit, callback loop, and RAM-only callback store.
 - `cmd/mailpuff/main.go` - legacy Go reference for orchestration behavior during migration.
 - `pkg/config` - environment parsing, defaults, required variable validation.
 - `pkg/imap` - IMAP connect/select/search/fetch/mark-seen wrapper.
@@ -54,8 +55,9 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/viewer/http.rs` serves `/view` and `/mark_read`; `/mark_read` authorizes without incrementing views.
 
 ### Telegram
-- `pkg/telegram/telegram.go` sends one message with `Open html` URL button and `Mark as read` callback button.
-- Mark-read callback state is in memory in `cmd/mailpuff/main.go`; expired/missing callback keys should be treated as invalid links.
+- `src/telegram/bot.rs` formats Telegram HTML messages, sends `Open html` + `Mark as read`, answers callbacks, and edits keyboards to keep only `Open html`.
+- `src/telegram/callbacks.rs` owns RAM-only callback keys (`mark:<key>`), page/token lookup, and the callback loop. Until orchestration is wired, the runtime loop is active but the store is not populated automatically.
+- Legacy `pkg/telegram/telegram.go` and callback code in `cmd/mailpuff/main.go` remain behavior references for orchestration wiring.
 - When mail becomes read, keyboard should be edited to remove `Mark as read` and keep only `Open html`.
 
 ## Development Practices
@@ -75,6 +77,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `src/mail_source` - provider-neutral source model for IMAP and future custom providers.
 - `src/email` - Rust email summary parsing and MIME fallback tests.
 - `src/viewer` - Rust viewer store, sanitizer, HTTP routes, and tests.
+- `src/telegram` - Rust Telegram formatting, callback store, callback handler, and callback tests.
 - `cmd/mailpuff/main.go` - legacy end-to-end data flow and Telegram/IMAP/viewer integration.
 - `pkg/viewer/viewer.go` - HTTP routes, token checks, TTL/max-view logic.
 - `pkg/config/config.go` - required env vars and defaults.

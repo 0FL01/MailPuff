@@ -142,7 +142,7 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "tim
 axum = "0.8.9"
 tower-http = { version = "0.6.10", features = ["trace", "timeout", "set-header"] }
 
-teloxide = { version = "0.17.0", default-features = true }
+teloxide = { version = "0.17.0", default-features = false, features = ["rustls"] }
 
 async-imap = "0.11.2"
 tokio-rustls = "0.26.4"
@@ -694,6 +694,12 @@ Manual E2E:
 * Implement edit keyboard.
 * Implement callback loop.
 * Add callback store.
+
+Утверждённые решения для Phase 4:
+
+* Scope Phase 4: без poll loop; только Telegram layer и callback handling.
+* Telegram dependency: `teloxide 0.17.0`; использовать Rustls features вместо default native TLS, чтобы Alpine Docker build не зависел от OpenSSL.
+* Callback loop включается в runtime сразу, даже если до Phase 5 callback store ещё не наполняется автоматически; это безопасно и даёт корректный `Link expired` для старых кнопок.
 
 ### Phase 5 — Orchestration
 
