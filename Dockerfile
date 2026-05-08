@@ -1,34 +1,22 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:1.25-alpine AS builder
-ENV GOTOOLCHAIN=auto
+FROM rust:1.94-alpine AS builder
 WORKDIR /src
 
-# Install git and CA certs
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache musl-dev
 
-# Cache dependencies
-COPY go.mod go.sum ./
-RUN go mod download
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 
-# Copy source
-COPY . .
-
-# Refresh dependencies to regenerate go.sum after COPY
-RUN go mod download
-RUN go mod tidy
-
-# Build static binary
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/mailpuff ./cmd/mailpuff
+RUN cargo build --release --locked
 
 FROM alpine:3.22
 WORKDIR /app
 
-# CA certificates and tzdata for correct HTTPS and timezone handling
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S app && adduser -S app -G app
 
-COPY --from=builder /out/mailpuff /app/mailpuff
+COPY --from=builder /src/target/release/mailpuff /app/mailpuff
 
 USER app
 

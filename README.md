@@ -2,7 +2,9 @@
 
 Пересылка новых писем из IMAP в Telegram с безопасной ссылкой для просмотра HTML‑содержимого. Сообщения в Telegram не удаляются автоматически; HTML‑страница очищается из памяти по TTL или при превышении лимита просмотров.
 
-## Как это работает
+> Статус миграции: ветка `rust` сейчас содержит Phase 1 Rust skeleton. Root `Dockerfile` уже собирает Rust binary `mailpuff`; полная IMAP/viewer/Telegram логика остаётся в Go-коде как reference до следующих фаз миграции.
+
+## Целевое поведение
 - Периодический опрос IMAP папки (по умолчанию `INBOX`).
 - Парсинг письма: тема, отправитель, тело (`HTML` или безопасный `text/plain` → `<pre>`).
 - Публикация HTML во встроенном in‑memory viewer с:
@@ -25,6 +27,13 @@ docker compose up -d
 docker compose logs -f
 ```
 
+### Локальные проверки Rust skeleton
+```
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+```
+
 ### Вариант 2: Одиночный контейнер `docker run`
 ```
 docker run -d \
@@ -44,23 +53,28 @@ docker run -d \
 - `VIEWER_URL_BASE` — полный базовый URL до `/view` (параметры `id`/`token` добавляются автоматически)
 
 Опциональные (значения по умолчанию):
-- `IMAP_PORT` (993), `IMAP_TLS` (true), `IMAP_MAILBOX` (INBOX)
+- `MAIL_SOURCE` (imap) — тип источника писем; `proton_custom` зарезервирован
+- `IMAP_PORT` (993), `IMAP_TLS` (true), `IMAP_ACCEPT_INVALID_CERTS` (false), `IMAP_MAILBOX` (INBOX)
 - `IMAP_POLL_INTERVAL` (60s) — период опроса
 - `IMAP_FORCE_RECONNECT` (60s) — дополнительный интервал для переборов соединения (внутренняя логика)
 - `IMAP_MARK_SEEN` (false) — помечать письмо прочитанным при первом открытии HTML‑страницы по ссылке
 - `HTTP_ADDR` (:8080) — адрес HTTP‑сервера viewer
 - `VIEWER_PAGE_TTL` (48h) — срок жизни страницы
 - `VIEWER_PAGE_MAX_VIEWS` (3) — лимит просмотров (<=0 — без ограничения)
+- `VIEWER_REMOTE_IMAGES` (allow) — `allow` или `block`
+- `RUST_LOG` (info) — фильтр structured logging
 - `TZ` — часовой пояс контейнера (например, `Europe/Moscow`)
 
 ## Пример `.env`
 ```
 # IMAP
+MAIL_SOURCE=imap
 IMAP_HOST=imap.example.com
 IMAP_PORT=993
 IMAP_USERNAME=user@example.com
 IMAP_PASSWORD=app-password
 IMAP_TLS=true
+IMAP_ACCEPT_INVALID_CERTS=false
 IMAP_MAILBOX=INBOX
 IMAP_POLL_INTERVAL=60s
 IMAP_MARK_SEEN=false
@@ -79,6 +93,10 @@ HTTP_ADDR=:8080
 VIEWER_URL_BASE=http://localhost:8080/view
 VIEWER_PAGE_TTL=48h
 VIEWER_PAGE_MAX_VIEWS=3
+VIEWER_REMOTE_IMAGES=allow
+
+# Logging
+RUST_LOG=info
 
 # Часовой пояс внутри контейнера (опционально)
 TZ=UTC
@@ -96,9 +114,11 @@ TZ=UTC
 - Работа через HTTPS: рекомендуем публиковать viewer за обратным прокси и выставить `VIEWER_URL_BASE` с `https`.
 
 ## Заметки безопасности
-- `IMAP_TLS=true` настоятельно рекомендуется. При `IMAP_TLS=false` отключается проверка TLS‑сертификата соединения IMAP (небезопасно).
+- `IMAP_TLS=true` настоятельно рекомендуется. `IMAP_TLS=false` в Rust-версии является legacy compatibility mode и не должен молча включать plaintext IMAP.
+- `IMAP_ACCEPT_INVALID_CERTS=true` отключает проверку TLS‑сертификата IMAP и должен использоваться только осознанно.
 - Viewer хранит страницы в памяти процесса. При рестарте контейнера опубликованные страницы будут утрачены.
 
 ## Ограничения
+- Phase 1 Rust image пока является skeleton-only и ждёт следующие фазы миграции.
 - Дедупликация UID работает только в рамках одного запуска процесса; после рестарта те же письма могут быть обработаны повторно.
 - Письма без `HTML` и `text/plain` будут пропущены (см. логи).

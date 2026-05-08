@@ -1,0 +1,38 @@
+[package]
+name = "mailpuff"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Docker-only mail-to-Telegram bridge with temporary in-memory HTML viewer"
+publish = false
+
+[[bin]]
+name = "mailpuff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+figment = { version = "0.10", features = ["env"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "z"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+await_holding_lock = "deny"
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+wildcard_dependencies = "warn"

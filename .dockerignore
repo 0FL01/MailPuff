@@ -13,6 +13,8 @@ bin
 build
 dist
 .cache
+target
+target/
 
 # OS/editor
 *.log
