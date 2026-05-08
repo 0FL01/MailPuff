@@ -136,6 +136,9 @@ impl TelegramMessageRef {
 pub enum TelegramError {
     #[error("Telegram API request failed: {0}")]
     Request(#[from] teloxide::RequestError),
+
+    #[error("Telegram backend failed: {0}")]
+    Backend(String),
 }
 
 #[must_use]

@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
@@ -8,10 +8,10 @@ use url::Url;
 use crate::{
     email::parser::parse_email_summary,
     mail_source::{MailSource, MessageRef},
-    state::{RuntimeState, RuntimeStateError},
+    state::{RuntimeState, RuntimeStateError, TrackedMessage},
     telegram::{
         CallbackStore, SendEmailMessage, TelegramBot, TelegramError, TelegramMessageRef,
-        callbacks::{CallbackTelegramApi, build_viewer_url},
+        callbacks::{CallbackStoreError, CallbackTelegramApi, build_viewer_url},
     },
     viewer::{
         http::{MarkReadError, MarkReadHandler, MarkReadResult},
@@ -20,7 +20,7 @@ use crate::{
 };
 
 #[async_trait]
-pub trait EmailTelegramApi: Send + Sync {
+pub trait EmailTelegramApi: CallbackTelegramApi + Send + Sync {
     async fn send_email_message(
         &self,
         request: SendEmailMessage<'_>,
@@ -68,10 +68,14 @@ impl PollService {
 
     pub async fn poll_once(&self) -> Result<PollCycleStats, PollError> {
         let unread = self.mail_source.list_unread().await?;
+        let unread_set = unread.iter().cloned().collect::<HashSet<_>>();
         let mut stats = PollCycleStats {
             unread: unread.len(),
             ..PollCycleStats::default()
         };
+
+        self.auto_hide_externally_read(&unread_set, &mut stats)
+            .await?;
 
         for message in unread {
             self.process_unread_message(message, &mut stats).await?;
@@ -210,6 +214,87 @@ impl PollService {
         Ok(())
     }
 
+    async fn auto_hide_externally_read(
+        &self,
+        unread: &HashSet<MessageRef>,
+        stats: &mut PollCycleStats,
+    ) -> Result<(), PollError> {
+        for tracked in self.state.tracked_messages()? {
+            if unread.contains(&tracked.mail_ref) {
+                continue;
+            }
+
+            self.auto_hide_tracked_message(tracked, stats).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn auto_hide_tracked_message(
+        &self,
+        tracked: TrackedMessage,
+        stats: &mut PollCycleStats,
+    ) -> Result<(), PollError> {
+        let Some(callback_payload) = self.callback_store.lookup_page(tracked.page_id)? else {
+            stats.stale_tracked += 1;
+            self.remove_tracked_message(&tracked.mail_ref, tracked.page_id)?;
+            tracing::warn!(
+                source = %tracked.mail_ref.source,
+                stable_id = %tracked.mail_ref.stable_id,
+                "tracked message has no callback payload; stale tracking removed"
+            );
+            return Ok(());
+        };
+
+        let viewer_url = build_viewer_url(
+            &self.viewer_url_base,
+            tracked.page_id,
+            callback_payload.token.expose_secret(),
+        );
+
+        if let Err(error) = self
+            .telegram
+            .edit_open_only_keyboard(tracked.telegram_ref, viewer_url)
+            .await
+        {
+            stats.auto_hide_errors += 1;
+            tracing::error!(
+                source = %tracked.mail_ref.source,
+                stable_id = %tracked.mail_ref.stable_id,
+                %error,
+                "failed to auto-hide telegram mark-read button"
+            );
+            return Ok(());
+        }
+
+        let _ = self.callback_store.delete_page(tracked.page_id)?;
+        self.remove_tracked_message(&tracked.mail_ref, tracked.page_id)?;
+        stats.auto_hidden += 1;
+
+        tracing::info!(
+            source = %tracked.mail_ref.source,
+            stable_id = %tracked.mail_ref.stable_id,
+            telegram_chat_id = tracked.telegram_ref.chat_id,
+            telegram_message_id = tracked.telegram_ref.message_id,
+            "external read detected; telegram mark-read button hidden"
+        );
+
+        Ok(())
+    }
+
+    fn remove_tracked_message(
+        &self,
+        mail_ref: &MessageRef,
+        page_id: uuid::Uuid,
+    ) -> Result<(), PollError> {
+        let removed = self.state.remove_tracked(mail_ref)?;
+        if removed.is_none() {
+            let _ = self.state.remove_tracked_by_page(page_id)?;
+        }
+
+        Ok(())
+    }
+
     fn delete_callback_and_page(&self, page_id: uuid::Uuid) {
         if let Err(error) = self.callback_store.delete_page(page_id) {
             tracing::error!(%error, "failed to cleanup callback after poll error");
@@ -239,6 +324,7 @@ pub async fn run_poll_loop(service: PollService, poll_interval: Duration) {
 pub struct PollCycleStats {
     pub unread: usize,
     pub processed: usize,
+    pub auto_hidden: usize,
     pub skipped_processed: usize,
     pub skipped_no_body: usize,
     pub fetch_errors: usize,
@@ -246,6 +332,8 @@ pub struct PollCycleStats {
     pub store_errors: usize,
     pub callback_errors: usize,
     pub telegram_errors: usize,
+    pub auto_hide_errors: usize,
+    pub stale_tracked: usize,
 }
 
 #[derive(Debug, Error)]
@@ -255,6 +343,9 @@ pub enum PollError {
 
     #[error(transparent)]
     RuntimeState(#[from] RuntimeStateError),
+
+    #[error(transparent)]
+    CallbackStore(#[from] CallbackStoreError),
 }
 
 #[derive(Debug, Error)]
@@ -454,6 +545,7 @@ mod tests {
         edits: Mutex<Vec<(TelegramMessageRef, Url)>>,
         sent: Mutex<Vec<SentEmail>>,
         fail_send: bool,
+        fail_edit: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -478,6 +570,10 @@ mod tests {
             message: TelegramMessageRef,
             viewer_url: Url,
         ) -> std::result::Result<(), TelegramError> {
+            if self.fail_edit {
+                return Err(TelegramError::Backend("boom".to_owned()));
+            }
+
             self.edits
                 .lock()
                 .expect("edits lock")
@@ -704,6 +800,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_once_auto_hides_externally_read_message_and_cleans_mappings()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let page_id = uuid::Uuid::new_v4();
+        let telegram_ref = TelegramMessageRef::new(100, 200);
+        let mail_source = Arc::new(FakeMailSource::default());
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        state.track_message(mail_ref.clone(), page_id, telegram_ref)?;
+        let callback = callback_store.create(page_id, SecretString::from("secret".to_owned()))?;
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            page_store,
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(
+            stats,
+            PollCycleStats {
+                auto_hidden: 1,
+                ..PollCycleStats::default()
+            }
+        );
+        assert_eq!(state.tracked_len()?, 0);
+        assert!(callback_store.lookup(&callback.key)?.is_none());
+        assert!(mail_source.fetched.lock().expect("fetched lock").is_empty());
+        let edits = telegram.edits.lock().expect("edits lock");
+        assert_eq!(
+            edits.as_slice(),
+            [(
+                telegram_ref,
+                Url::parse(&format!(
+                    "https://mail.example.com/view?id={page_id}&token=secret"
+                ))?
+            )]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_mark_button_when_tracked_message_is_still_unseen()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let page_id = uuid::Uuid::new_v4();
+        let telegram_ref = TelegramMessageRef::new(100, 200);
+        let mail_source = Arc::new(FakeMailSource::default());
+        mail_source.set_unread(vec![mail_ref.clone()]);
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        let _ = state.mark_processed(mail_ref.clone())?;
+        state.track_message(mail_ref.clone(), page_id, telegram_ref)?;
+        let callback = callback_store.create(page_id, SecretString::from("secret".to_owned()))?;
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            page_store,
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.unread, 1);
+        assert_eq!(stats.skipped_processed, 1);
+        assert_eq!(stats.auto_hidden, 0);
+        assert_eq!(state.tracked_len()?, 1);
+        assert!(callback_store.lookup(&callback.key)?.is_some());
+        assert!(telegram.edits.lock().expect("edits lock").is_empty());
+        assert!(mail_source.fetched.lock().expect("fetched lock").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_mappings_when_auto_hide_edit_fails()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let page_id = uuid::Uuid::new_v4();
+        let telegram_ref = TelegramMessageRef::new(100, 200);
+        let mail_source = Arc::new(FakeMailSource::default());
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram {
+            fail_edit: true,
+            ..FakeTelegram::default()
+        });
+        state.track_message(mail_ref.clone(), page_id, telegram_ref)?;
+        let callback = callback_store.create(page_id, SecretString::from("secret".to_owned()))?;
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            page_store,
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.auto_hidden, 0);
+        assert_eq!(stats.auto_hide_errors, 1);
+        assert_eq!(state.tracked_len()?, 1);
+        assert!(callback_store.lookup(&callback.key)?.is_some());
+        assert!(telegram.edits.lock().expect("edits lock").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_once_removes_stale_tracking_without_callback_payload()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let mail_ref = mail_ref();
+        let page_id = uuid::Uuid::new_v4();
+        let telegram_ref = TelegramMessageRef::new(100, 200);
+        let mail_source = Arc::new(FakeMailSource::default());
+        let page_store = page_store();
+        let state = Arc::new(RuntimeState::new());
+        let callback_store = Arc::new(CallbackStore::new());
+        let telegram = Arc::new(FakeTelegram::default());
+        state.track_message(mail_ref, page_id, telegram_ref)?;
+        let service = poll_service(
+            Arc::clone(&mail_source),
+            page_store,
+            Arc::clone(&state),
+            Arc::clone(&callback_store),
+            Arc::clone(&telegram),
+        )?;
+
+        let stats = service.poll_once().await?;
+
+        assert_eq!(stats.stale_tracked, 1);
+        assert_eq!(stats.auto_hidden, 0);
+        assert_eq!(state.tracked_len()?, 0);
+        assert!(callback_store.is_empty()?);
+        assert!(telegram.edits.lock().expect("edits lock").is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn poll_once_does_not_mark_processed_when_telegram_send_fails()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let mail_ref = mail_ref();
@@ -717,6 +962,7 @@ mod tests {
             edits: Mutex::new(Vec::new()),
             sent: Mutex::new(Vec::new()),
             fail_send: true,
+            fail_edit: false,
         });
         let service = poll_service(
             Arc::clone(&mail_source),

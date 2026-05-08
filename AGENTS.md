@@ -43,7 +43,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 ### IMAP Polling
 - Rust migration should route polling through `src/mail_source::MailSource`, not directly through IMAP-specific state.
 - `src/mail_source/imap.rs` implements connect/login/select, `UID SEARCH UNSEEN`, `UID FETCH RFC822`, and `+FLAGS (\Seen)` mark-read.
-- `src/orchestration.rs` runs the Rust poll loop MVP: list unread, fetch raw email, parse, create viewer page/callback, send Telegram, then update RAM indices.
+- `src/orchestration.rs` runs the Rust poll loop MVP: compare current unread with tracked messages for auto-hide, fetch raw email, parse, create viewer page/callback, send Telegram, then update RAM indices.
 - Legacy main loop lives in `cmd/mailpuff/main.go`; it reconnects each poll, searches `UNSEEN`, fetches emails, skips already processed UIDs, and sleeps `IMAP_POLL_INTERVAL`.
 - Legacy IMAP operations are isolated in `pkg/imap/imap.go`; use Rust `src/mail_source` for new code.
 - `IMAP_FORCE_RECONNECT` is loaded in config but is not currently used by the polling logic.
@@ -79,7 +79,7 @@ Tech stack target: Rust `2024` (`rustc >= 1.94`), Docker-only runtime, `tokio`, 
 - `README.md` - env variables, viewer behavior, security notes, known limitations.
 - `src/config.rs` - Rust env contract and validation behavior.
 - `src/mail_source` - provider-neutral source model for IMAP and future custom providers.
-- `src/state.rs` and `src/orchestration.rs` - RAM-only indices, poll loop MVP, and shared mark-read flow.
+- `src/state.rs` and `src/orchestration.rs` - RAM-only indices, poll loop MVP, auto-hide external read, and shared mark-read flow.
 - `src/email` - Rust email summary parsing and MIME fallback tests.
 - `src/viewer` - Rust viewer store, sanitizer, HTTP routes, and tests.
 - `src/telegram` - Rust Telegram formatting, callback store, callback handler, and callback tests.
